@@ -5,6 +5,7 @@ members = [
     "nodejs",
     "python",
     "java/core/lancedb-jni",
+    "go"
 ]
 # Python package needs to be built by maturin.
 exclude = ["python"]
