@@ -1,17 +1,8 @@
-#  Copyright 2023 LanceDB Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import functools
+import os
 from copy import copy
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -37,7 +28,7 @@ from pydantic import BaseModel
 
 class MockDB:
     def __init__(self, uri: Path):
-        self.uri = uri
+        self.uri = str(uri)
         self.read_consistency_interval = None
 
     @functools.cached_property
@@ -71,6 +62,55 @@ def test_basic(db):
     assert table.name == "test"
     assert table.schema == ds.schema
     assert table.to_lance().to_table() == ds.to_table()
+
+
+def test_input_data_type(db, tmp_path):
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("name", pa.string()),
+            pa.field("age", pa.int32()),
+        ]
+    )
+
+    data = {
+        "id": [1, 2, 3, 4, 5],
+        "name": ["Alice", "Bob", "Charlie", "David", "Eve"],
+        "age": [25, 30, 35, 40, 45],
+    }
+    record_batch = pa.RecordBatch.from_pydict(data, schema=schema)
+    pa_reader = pa.RecordBatchReader.from_batches(record_batch.schema, [record_batch])
+    pa_table = pa.Table.from_batches([record_batch])
+
+    def create_dataset(tmp_path):
+        path = os.path.join(tmp_path, "test_source_dataset")
+        pa.dataset.write_dataset(pa_table, path, format="parquet")
+        return pa.dataset.dataset(path, format="parquet")
+
+    pa_dataset = create_dataset(tmp_path)
+    pa_scanner = pa_dataset.scanner()
+
+    input_types = [
+        ("RecordBatchReader", pa_reader),
+        ("RecordBatch", record_batch),
+        ("Table", pa_table),
+        ("Dataset", pa_dataset),
+        ("Scanner", pa_scanner),
+    ]
+    for input_type, input_data in input_types:
+        table_name = f"test_{input_type.lower()}"
+        ds = LanceTable.create(db, table_name, data=input_data).to_lance()
+        assert ds.schema == schema
+        assert ds.count_rows() == 5
+
+        assert ds.schema.field("id").type == pa.int64()
+        assert ds.schema.field("name").type == pa.string()
+        assert ds.schema.field("age").type == pa.int32()
+
+        result_table = ds.to_table()
+        assert result_table.column("id").to_pylist() == data["id"]
+        assert result_table.column("name").to_pylist() == data["name"]
+        assert result_table.column("age").to_pylist() == data["age"]
 
 
 @pytest.mark.asyncio
@@ -151,6 +191,24 @@ def test_empty_table(db):
         {"vector": [5.9, 26.5], "item": "bar", "price": 20.0},
     ]
     tbl.add(data=data)
+
+
+def test_add_dictionary(db):
+    schema = pa.schema(
+        [
+            pa.field("vector", pa.list_(pa.float32(), 2)),
+            pa.field("item", pa.string()),
+            pa.field("price", pa.float32()),
+        ]
+    )
+    tbl = LanceTable.create(db, "test", schema=schema)
+    data = {"vector": [3.1, 4.1], "item": "foo", "price": 10.0}
+    with pytest.raises(ValueError) as excep_info:
+        tbl.add(data=data)
+    assert (
+        str(excep_info.value)
+        == "Cannot add a single dictionary to a table. Use a list."
+    )
 
 
 def test_add(db):
@@ -283,7 +341,6 @@ def test_polars(db):
 
 
 def _add(table, schema):
-    # table = LanceTable(db, "test")
     assert len(table) == 2
 
     table.add([{"vector": [6.3, 100.5], "item": "new", "price": 30.0}])
@@ -499,6 +556,7 @@ def test_update_types(db):
                 "date": date(2021, 1, 1),
                 "vector1": [1.0, 0.0],
                 "vector2": [1.0, 1.0],
+                "binary": b"abc",
             }
         ],
     )
@@ -512,6 +570,7 @@ def test_update_types(db):
             date="DATE '2021-01-02'",
             vector1="[2.0, 2.0]",
             vector2="[3.0, 3.0]",
+            binary="X'646566'",
         )
     )
     actual = table.to_arrow().to_pylist()[0]
@@ -523,6 +582,7 @@ def test_update_types(db):
         date=date(2021, 1, 2),
         vector1=[2.0, 2.0],
         vector2=[3.0, 3.0],
+        binary=b"def",
     )
     assert actual == expected
 
@@ -536,6 +596,7 @@ def test_update_types(db):
             date=date(2021, 1, 3),
             vector1=[3.0, 3.0],
             vector2=np.array([4.0, 4.0]),
+            binary=b"def",
         )
     )
     actual = table.to_arrow().to_pylist()[0]
@@ -547,6 +608,7 @@ def test_update_types(db):
         date=date(2021, 1, 3),
         vector1=[3.0, 3.0],
         vector2=[4.0, 4.0],
+        binary=b"def",
     )
     assert actual == expected
 
@@ -592,11 +654,13 @@ def test_merge_insert(db):
     new_data = pa.table({"a": [2, 4], "b": ["x", "z"]})
 
     # replace-range
-    table.merge_insert(
-        "a"
-    ).when_matched_update_all().when_not_matched_insert_all().when_not_matched_by_source_delete(
-        "a > 2"
-    ).execute(new_data)
+    (
+        table.merge_insert("a")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .when_not_matched_by_source_delete("a > 2")
+        .execute(new_data)
+    )
 
     expected = pa.table({"a": [1, 2, 4], "b": ["a", "x", "z"]})
     assert table.to_arrow().sort_by("a") == expected
@@ -612,6 +676,75 @@ def test_merge_insert(db):
 
     expected = pa.table({"a": [2, 4], "b": ["x", "z"]})
     assert table.to_arrow().sort_by("a") == expected
+
+
+@pytest.mark.asyncio
+async def test_merge_insert_async(db_async: AsyncConnection):
+    data = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+    table = await db_async.create_table("some_table", data=data)
+    assert await table.count_rows() == 3
+    version = await table.version()
+
+    new_data = pa.table({"a": [2, 3, 4], "b": ["x", "y", "z"]})
+
+    # upsert
+    await (
+        table.merge_insert("a")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(new_data)
+    )
+    expected = pa.table({"a": [1, 2, 3, 4], "b": ["a", "x", "y", "z"]})
+    assert (await table.to_arrow()).sort_by("a") == expected
+
+    await table.checkout(version)
+    await table.restore()
+
+    # conditional update
+    await (
+        table.merge_insert("a")
+        .when_matched_update_all(where="target.b = 'b'")
+        .execute(new_data)
+    )
+    expected = pa.table({"a": [1, 2, 3], "b": ["a", "x", "c"]})
+    assert (await table.to_arrow()).sort_by("a") == expected
+
+    await table.checkout(version)
+    await table.restore()
+
+    # insert-if-not-exists
+    await table.merge_insert("a").when_not_matched_insert_all().execute(new_data)
+    expected = pa.table({"a": [1, 2, 3, 4], "b": ["a", "b", "c", "z"]})
+    assert (await table.to_arrow()).sort_by("a") == expected
+
+    await table.checkout(version)
+    await table.restore()
+
+    # replace-range
+    new_data = pa.table({"a": [2, 4], "b": ["x", "z"]})
+    await (
+        table.merge_insert("a")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .when_not_matched_by_source_delete("a > 2")
+        .execute(new_data)
+    )
+    expected = pa.table({"a": [1, 2, 4], "b": ["a", "x", "z"]})
+    assert (await table.to_arrow()).sort_by("a") == expected
+
+    await table.checkout(version)
+    await table.restore()
+
+    # replace-range no condition
+    await (
+        table.merge_insert("a")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .when_not_matched_by_source_delete()
+        .execute(new_data)
+    )
+    expected = pa.table({"a": [2, 4], "b": ["x", "z"]})
+    assert (await table.to_arrow()).sort_by("a") == expected
 
 
 def test_create_with_embedding_function(db):
@@ -735,7 +868,7 @@ def test_create_scalar_index(db):
     indices = table.to_lance().list_indices()
     assert len(indices) == 1
     scalar_index = indices[0]
-    assert scalar_index["type"] == "Scalar"
+    assert scalar_index["type"] == "BTree"
 
     # Confirm that prefiltering still works with the scalar index column
     results = table.search().where("x = 'c'").to_arrow()
@@ -858,13 +991,10 @@ def test_count_rows(db):
     assert table.count_rows(filter="text='bar'") == 1
 
 
-def test_hybrid_search(db, tmp_path):
-    # This test uses an FTS index
-    pytest.importorskip("lancedb.fts")
-
+def setup_hybrid_search_table(tmp_path, embedding_func):
     db = MockDB(str(tmp_path))
     # Create a LanceDB table schema with a vector and a text column
-    emb = EmbeddingFunctionRegistry.get_instance().get("test")()
+    emb = EmbeddingFunctionRegistry.get_instance().get(embedding_func)()
 
     class MyTable(LanceModel):
         text: str = emb.SourceField()
@@ -897,6 +1027,15 @@ def test_hybrid_search(db, tmp_path):
     # Create a fts index
     table.create_fts_index("text")
 
+    return table, MyTable, emb
+
+
+def test_hybrid_search(tmp_path):
+    # This test uses an FTS index
+    pytest.importorskip("lancedb.fts")
+
+    table, MyTable, emb = setup_hybrid_search_table(tmp_path, "test")
+
     result1 = (
         table.search("Our father who art in heaven", query_type="hybrid")
         .rerank(normalize="score")
@@ -911,6 +1050,16 @@ def test_hybrid_search(db, tmp_path):
         "Our father who art in heaven", query_type="hybrid"
     ).to_pydantic(MyTable)
 
+    # Test that double and single quote characters are handled with phrase_query()
+    (
+        table.search(
+            '"Aren\'t you a little short for a stormtrooper?" -- Leia',
+            query_type="hybrid",
+        )
+        .phrase_query(True)
+        .to_pydantic(MyTable)
+    )
+
     assert result1 == result3
 
     # with post filters
@@ -919,7 +1068,54 @@ def test_hybrid_search(db, tmp_path):
         .where("text='Arrrrggghhhhhhh'")
         .to_list()
     )
-    len(result) == 1
+    assert len(result) == 1
+
+    # with explicit query type
+    vector_query = list(range(emb.ndims()))
+    result = (
+        table.search(query_type="hybrid")
+        .vector(vector_query)
+        .text("Arrrrggghhhhhhh")
+        .to_arrow()
+    )
+    assert len(result) > 0
+    assert "_relevance_score" in result.column_names
+
+    # with vector_column_name
+    result = (
+        table.search(query_type="hybrid", vector_column_name="vector")
+        .vector(vector_query)
+        .text("Arrrrggghhhhhhh")
+        .to_arrow()
+    )
+    assert len(result) > 0
+    assert "_relevance_score" in result.column_names
+
+    # fail if only text or vector is provided
+    with pytest.raises(ValueError):
+        table.search(query_type="hybrid").to_list()
+    with pytest.raises(ValueError):
+        table.search(query_type="hybrid").vector(vector_query).to_list()
+    with pytest.raises(ValueError):
+        table.search(query_type="hybrid").text("Arrrrggghhhhhhh").to_list()
+
+
+def test_hybrid_search_metric_type(db, tmp_path):
+    # This test uses an FTS index
+    pytest.importorskip("lancedb.fts")
+
+    # Need to use nonnorm as the embedding function so L2 and dot results
+    # are different
+    table, _, _ = setup_hybrid_search_table(tmp_path, "nonnorm")
+
+    # with custom metric
+    result_dot = (
+        table.search("feeling lucky", query_type="hybrid").metric("dot").to_arrow()
+    )
+    result_l2 = table.search("feeling lucky", query_type="hybrid").to_arrow()
+    assert len(result_dot) > 0
+    assert len(result_l2) > 0
+    assert result_dot["_relevance_score"] != result_l2["_relevance_score"]
 
 
 @pytest.mark.parametrize(
@@ -1025,3 +1221,105 @@ async def test_time_travel(db_async: AsyncConnection):
     # Can't use restore if not checked out
     with pytest.raises(ValueError, match="checkout before running restore"):
         await table.restore()
+
+
+def test_sync_optimize(db):
+    table = LanceTable.create(
+        db,
+        "test",
+        data=[
+            {"vector": [3.1, 4.1], "item": "foo", "price": 10.0},
+            {"vector": [5.9, 26.5], "item": "bar", "price": 20.0},
+        ],
+    )
+
+    table.create_scalar_index("price", index_type="BTREE")
+    stats = table.to_lance().stats.index_stats("price_idx")
+    assert stats["num_indexed_rows"] == 2
+
+    table.add([{"vector": [2.0, 2.0], "item": "baz", "price": 30.0}])
+    assert table.count_rows() == 3
+    table.optimize()
+    stats = table.to_lance().stats.index_stats("price_idx")
+    assert stats["num_indexed_rows"] == 3
+
+
+@pytest.mark.asyncio
+async def test_sync_optimize_in_async(db):
+    table = LanceTable.create(
+        db,
+        "test",
+        data=[
+            {"vector": [3.1, 4.1], "item": "foo", "price": 10.0},
+            {"vector": [5.9, 26.5], "item": "bar", "price": 20.0},
+        ],
+    )
+
+    table.create_scalar_index("price", index_type="BTREE")
+    stats = table.to_lance().stats.index_stats("price_idx")
+    assert stats["num_indexed_rows"] == 2
+
+    table.add([{"vector": [2.0, 2.0], "item": "baz", "price": 30.0}])
+    assert table.count_rows() == 3
+    try:
+        table.optimize()
+    except Exception as e:
+        assert (
+            "Synchronous method called in asynchronous context. "
+            "If you are writing an asynchronous application "
+            "then please use the asynchronous APIs" in str(e)
+        )
+
+
+@pytest.mark.asyncio
+async def test_optimize(db_async: AsyncConnection):
+    table = await db_async.create_table(
+        "test",
+        data=[{"x": [1]}],
+    )
+    await table.add(
+        data=[
+            {"x": [2]},
+        ],
+    )
+    stats = await table.optimize()
+    expected = (
+        "OptimizeStats(compaction=CompactionStats { fragments_removed: 2, "
+        "fragments_added: 1, files_removed: 2, files_added: 1 }, "
+        "prune=RemovalStats { bytes_removed: 0, old_versions_removed: 0 })"
+    )
+    assert str(stats) == expected
+    assert stats.compaction.files_removed == 2
+    assert stats.compaction.files_added == 1
+    assert stats.compaction.fragments_added == 1
+    assert stats.compaction.fragments_removed == 2
+    assert stats.prune.bytes_removed == 0
+    assert stats.prune.old_versions_removed == 0
+
+    stats = await table.optimize(cleanup_older_than=timedelta(seconds=0))
+    assert stats.prune.bytes_removed > 0
+    assert stats.prune.old_versions_removed == 3
+
+    assert await table.query().to_arrow() == pa.table({"x": [[1], [2]]})
+
+
+@pytest.mark.asyncio
+async def test_optimize_delete_unverified(db_async: AsyncConnection, tmp_path):
+    table = await db_async.create_table(
+        "test",
+        data=[{"x": [1]}],
+    )
+    await table.add(
+        data=[
+            {"x": [2]},
+        ],
+    )
+    version = await table.version()
+    path = tmp_path / "test.lance" / "_versions" / f"{version - 1}.manifest"
+    os.remove(path)
+    stats = await table.optimize(delete_unverified=False)
+    assert stats.prune.old_versions_removed == 0
+    stats = await table.optimize(
+        cleanup_older_than=timedelta(seconds=0), delete_unverified=True
+    )
+    assert stats.prune.old_versions_removed == 2

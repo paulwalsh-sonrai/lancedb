@@ -26,11 +26,23 @@ class SentenceTransformerEmbeddings(TextEmbeddingFunction):
     An embedding function that uses the sentence-transformers library
 
     https://huggingface.co/sentence-transformers
+
+    Parameters
+    ----------
+    name: str, default "all-MiniLM-L6-v2"
+        The name of the model to use.
+    device: str, default "cpu"
+        The device to use for the model
+    normalize: bool, default True
+        Whether to normalize the embeddings
+    trust_remote_code: bool, default True
+        Whether to trust the remote code
     """
 
     name: str = "all-MiniLM-L6-v2"
     device: str = "cpu"
     normalize: bool = True
+    trust_remote_code: bool = True
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -40,8 +52,8 @@ class SentenceTransformerEmbeddings(TextEmbeddingFunction):
     def embedding_model(self):
         """
         Get the sentence-transformers embedding model specified by the
-        name and device. This is cached so that the model is only loaded
-        once per process.
+        name, device, and trust_remote_code. This is cached so that the
+        model is only loaded once per process.
         """
         return self.get_embedding_model()
 
@@ -71,12 +83,14 @@ class SentenceTransformerEmbeddings(TextEmbeddingFunction):
     def get_embedding_model(self):
         """
         Get the sentence-transformers embedding model specified by the
-        name and device. This is cached so that the model is only loaded
-        once per process.
+        name, device, and trust_remote_code. This is cached so that the
+        model is only loaded once per process.
 
         TODO: use lru_cache instead with a reasonable/configurable maxsize
         """
         sentence_transformers = attempt_import_or_raise(
             "sentence_transformers", "sentence-transformers"
         )
-        return sentence_transformers.SentenceTransformer(self.name, device=self.device)
+        return sentence_transformers.SentenceTransformer(
+            self.name, device=self.device, trust_remote_code=self.trust_remote_code
+        )

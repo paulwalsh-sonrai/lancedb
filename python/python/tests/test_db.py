@@ -13,6 +13,7 @@
 
 import re
 from datetime import timedelta
+import os
 
 import lancedb
 import numpy as np
@@ -22,7 +23,8 @@ import pytest
 from lancedb.pydantic import LanceModel, Vector
 
 
-def test_basic(tmp_path):
+@pytest.mark.parametrize("use_tantivy", [True, False])
+def test_basic(tmp_path, use_tantivy):
     db = lancedb.connect(tmp_path)
 
     assert db.uri == str(tmp_path)
@@ -55,7 +57,7 @@ def test_basic(tmp_path):
     assert len(rs) == 1
     assert rs["item"].iloc[0] == "foo"
 
-    table.create_fts_index(["item"])
+    table.create_fts_index("item", use_tantivy=use_tantivy)
     rs = table.search("bar", query_type="fts").to_pandas()
     assert len(rs) == 1
     assert rs["item"].iloc[0] == "bar"
@@ -232,6 +234,43 @@ def test_create_mode(tmp_path):
     assert tbl.to_pandas().item.tolist() == ["fizz", "buzz"]
 
 
+def test_create_table_from_iterator(tmp_path):
+    db = lancedb.connect(tmp_path)
+
+    def gen_data():
+        for _ in range(10):
+            yield pa.RecordBatch.from_arrays(
+                [
+                    pa.array([[3.1, 4.1]], pa.list_(pa.float32(), 2)),
+                    pa.array(["foo"]),
+                    pa.array([10.0]),
+                ],
+                ["vector", "item", "price"],
+            )
+
+    table = db.create_table("test", data=gen_data())
+    assert table.count_rows() == 10
+
+
+@pytest.mark.asyncio
+async def test_create_table_from_iterator_async(tmp_path):
+    db = await lancedb.connect_async(tmp_path)
+
+    def gen_data():
+        for _ in range(10):
+            yield pa.RecordBatch.from_arrays(
+                [
+                    pa.array([[3.1, 4.1]], pa.list_(pa.float32(), 2)),
+                    pa.array(["foo"]),
+                    pa.array([10.0]),
+                ],
+                ["vector", "item", "price"],
+            )
+
+    table = await db.create_table("test", data=gen_data())
+    assert await table.count_rows() == 10
+
+
 def test_create_exist_ok(tmp_path):
     db = lancedb.connect(tmp_path)
     data = pd.DataFrame(
@@ -297,6 +336,13 @@ async def test_close(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_context_manager(tmp_path):
+    with await lancedb.connect_async(tmp_path) as db:
+        assert db.is_open()
+    assert not db.is_open()
+
+
+@pytest.mark.asyncio
 async def test_create_mode_async(tmp_path):
     db = await lancedb.connect_async(tmp_path)
     data = pd.DataFrame(
@@ -308,7 +354,7 @@ async def test_create_mode_async(tmp_path):
     )
     await db.create_table("test", data=data)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError, match="already exists"):
         await db.create_table("test", data=data)
 
     new_data = pd.DataFrame(
@@ -336,7 +382,7 @@ async def test_create_exist_ok_async(tmp_path):
     )
     tbl = await db.create_table("test", data=data)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError, match="already exists"):
         await db.create_table("test", data=data)
 
     # open the table but don't add more rows
@@ -366,6 +412,40 @@ async def test_create_exist_ok_async(tmp_path):
     # )
     # with pytest.raises(ValueError):
     #     await db.create_table("test", schema=bad_schema, exist_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_create_table_v2_manifest_paths_async(tmp_path):
+    db = await lancedb.connect_async(tmp_path)
+    # Create table in v2 mode with v2 manifest paths enabled
+    tbl = await db.create_table(
+        "test_v2_manifest_paths",
+        data=[{"id": 0}],
+        use_legacy_format=False,
+        enable_v2_manifest_paths=True,
+    )
+    assert await tbl.uses_v2_manifest_paths()
+    manifests_dir = tmp_path / "test_v2_manifest_paths.lance" / "_versions"
+    for manifest in os.listdir(manifests_dir):
+        assert re.match(r"\d{20}\.manifest", manifest)
+
+    # Start a table in V1 mode then migrate
+    tbl = await db.create_table(
+        "test_v2_migration",
+        data=[{"id": 0}],
+        use_legacy_format=False,
+        enable_v2_manifest_paths=False,
+    )
+    assert not await tbl.uses_v2_manifest_paths()
+    manifests_dir = tmp_path / "test_v2_migration.lance" / "_versions"
+    for manifest in os.listdir(manifests_dir):
+        assert re.match(r"\d\.manifest", manifest)
+
+    await tbl.migrate_manifest_paths_v2()
+    assert await tbl.uses_v2_manifest_paths()
+
+    for manifest in os.listdir(manifests_dir):
+        assert re.match(r"\d{20}\.manifest", manifest)
 
 
 def test_open_table_sync(tmp_path):
@@ -498,6 +578,62 @@ def test_empty_or_nonexistent_table(tmp_path):
 
     test2 = db.create_table("test2", schema=TestModel)
     assert test.schema == test2.schema
+
+
+@pytest.mark.asyncio
+async def test_create_in_v2_mode(tmp_path):
+    def make_data():
+        for i in range(10):
+            yield pa.record_batch([pa.array([x for x in range(1024)])], names=["x"])
+
+    def make_table():
+        return pa.table([pa.array([x for x in range(10 * 1024)])], names=["x"])
+
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    db = await lancedb.connect_async(tmp_path)
+
+    # Create table in v1 mode
+    tbl = await db.create_table(
+        "test", data=make_data(), schema=schema, data_storage_version="legacy"
+    )
+
+    async def is_in_v2_mode(tbl):
+        batches = await tbl.query().to_batches(max_batch_length=1024 * 10)
+        num_batches = 0
+        async for batch in batches:
+            num_batches += 1
+        return num_batches < 10
+
+    assert not await is_in_v2_mode(tbl)
+
+    # Create table in v2 mode
+    tbl = await db.create_table(
+        "test_v2", data=make_data(), schema=schema, use_legacy_format=False
+    )
+
+    assert await is_in_v2_mode(tbl)
+
+    # Add data (should remain in v2 mode)
+    await tbl.add(make_table())
+
+    assert await is_in_v2_mode(tbl)
+
+    # Create empty table in v2 mode and add data
+    tbl = await db.create_table(
+        "test_empty_v2", data=None, schema=schema, use_legacy_format=False
+    )
+    await tbl.add(make_table())
+
+    assert await is_in_v2_mode(tbl)
+
+    # Create empty table uses v1 mode by default
+    tbl = await db.create_table(
+        "test_empty_v2_default", data=None, schema=schema, data_storage_version="legacy"
+    )
+    await tbl.add(make_table())
+
+    assert not await is_in_v2_mode(tbl)
 
 
 def test_replace_index(tmp_path):

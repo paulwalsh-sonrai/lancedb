@@ -3,31 +3,45 @@
 
 A Table is a collection of Records in a LanceDB Database. Tables in Lance have a schema that defines the columns and their types. These schemas can include nested columns and can evolve over time.
 
-This guide will show how to create tables, insert data into them, and update the data.  
+This guide will show how to create tables, insert data into them, and update the data.
 
 
 ## Creating a LanceDB Table
 
+Initialize a LanceDB connection and create a table
+
 === "Python"
-    Initialize a LanceDB connection and create a table using one of the many methods listed below.
 
     ```python
     import lancedb
     db = lancedb.connect("./.lancedb")
     ```
 
-=== "Javascript"
-
-    Initialize a VectorDB connection and create a table using one of the many methods listed below.
-
-    ```javascript
-    const lancedb = require("vectordb");
-
-    const uri = "data/sample-lancedb";
-    const db = await lancedb.connect(uri);
-    ```
-
     LanceDB allows ingesting data from various sources - `dict`, `list[dict]`, `pd.DataFrame`, `pa.Table` or a `Iterator[pa.RecordBatch]`. Let's take a look at some of the these.
+
+=== "Typescript[^1]"
+
+    === "@lancedb/lancedb"
+
+        ```typescript
+        import * as lancedb from "@lancedb/lancedb";
+        import * as arrow from "apache-arrow";
+
+        const uri = "data/sample-lancedb";
+        const db = await lancedb.connect(uri);
+        ```
+
+    === "vectordb (deprecated)"
+
+        ```typescript
+        const lancedb = require("vectordb");
+        const arrow = require("apache-arrow");
+
+        const uri = "data/sample-lancedb";
+        const db = await lancedb.connect(uri);
+        ```
+
+
 
 ### From list of tuples or dictionaries
 
@@ -45,102 +59,150 @@ This guide will show how to create tables, insert data into them, and update the
 
     db["my_table"].head()
     ```
+
     !!! info "Note"
-        If the table already exists, LanceDB will raise an error by default. 
+        If the table already exists, LanceDB will raise an error by default.
 
         `create_table` supports an optional `exist_ok` parameter. When set to True
         and the table exists, then it simply opens the existing table. The data you
         passed in will NOT be appended to the table in that case.
 
-        ```python
-        db.create_table("name", data, exist_ok=True)
-        ```
-        
-        Sometimes you want to make sure that you start fresh. If you want to 
-        overwrite the table, you can pass in mode="overwrite" to the createTable function.
-
-        ```python
-        db.create_table("name", data, mode="overwrite")
-        ```
-
-=== "Javascript"
-    You can create a LanceDB table in JavaScript using an array of JSON records as follows.
-
-    ```javascript
-    const tb = await db.createTable("my_table", [{
-        "vector": [3.1, 4.1],
-        "item": "foo",
-        "price": 10.0
-    }, {
-        "vector": [5.9, 26.5],
-        "item": "bar",
-        "price": 20.0
-    }]);
-    ```
-    !!! info "Note"
-    If the table already exists, LanceDB will raise an error by default. If you want to overwrite the table, you need to specify the `WriteMode` in the createTable function.
-
-    ```javascript
-    const table = await con.createTable(tableName, data, { writeMode: WriteMode.Overwrite })
+    ```python
+    db.create_table("name", data, exist_ok=True)
     ```
 
-    ### From a Pandas DataFrame
+    Sometimes you want to make sure that you start fresh. If you want to
+    overwrite the table, you can pass in mode="overwrite" to the createTable function.
 
     ```python
-    import pandas as pd
-
-    data = pd.DataFrame({
-        "vector": [[1.1, 1.2, 1.3, 1.4], [0.2, 1.8, 0.4, 3.6]],
-        "lat": [45.5, 40.1],
-        "long": [-122.7, -74.1]
-    })
-
-    db.create_table("my_table", data)
-
-    db["my_table"].head()
+    db.create_table("name", data, mode="overwrite")
     ```
-    !!! info "Note"
+
+=== "Typescript[^1]"
+    You can create a LanceDB table in JavaScript using an array of records as follows.
+
+    === "@lancedb/lancedb"
+
+
+        ```ts
+        --8<-- "nodejs/examples/basic.ts:create_table"
+        ```
+
+        This will infer the schema from the provided data. If you want to explicitly provide a schema, you can use `apache-arrow` to declare a schema
+
+        ```ts
+        --8<-- "nodejs/examples/basic.ts:create_table_with_schema"
+        ```
+
+        !!! info "Note"
+            `createTable` supports an optional `existsOk` parameter. When set to true
+            and the table exists, then it simply opens the existing table. The data you
+            passed in will NOT be appended to the table in that case.
+
+        ```ts
+        --8<-- "nodejs/examples/basic.ts:create_table_exists_ok"
+        ```
+
+        Sometimes you want to make sure that you start fresh. If you want to
+        overwrite the table, you can pass in mode: "overwrite" to the createTable function.
+
+        ```ts
+        --8<-- "nodejs/examples/basic.ts:create_table_overwrite"
+        ```
+
+    === "vectordb (deprecated)"
+
+        ```ts
+        --8<-- "docs/src/basic_legacy.ts:create_table"
+        ```
+
+        This will infer the schema from the provided data. If you want to explicitly provide a schema, you can use apache-arrow to declare a schema
+
+
+
+        ```ts
+        --8<-- "docs/src/basic_legacy.ts:create_table_with_schema"
+        ```
+
+        !!! warning
+            `existsOk` is not available in `vectordb`
+
+
+
+            If the table already exists, vectordb will raise an error by default.
+            You can use `writeMode: WriteMode.Overwrite` to overwrite the table.
+            But this will delete the existing table and create a new one with the same name.
+
+
+        Sometimes you want to make sure that you start fresh.
+
+        If you want to overwrite the table, you can pass in `writeMode: lancedb.WriteMode.Overwrite` to the createTable function.
+
+        ```ts
+        const table = await con.createTable(tableName, data, {
+            writeMode: WriteMode.Overwrite
+        })
+        ```
+
+### From a Pandas DataFrame
+
+```python
+import pandas as pd
+
+data = pd.DataFrame({
+    "vector": [[1.1, 1.2, 1.3, 1.4], [0.2, 1.8, 0.4, 3.6]],
+    "lat": [45.5, 40.1],
+    "long": [-122.7, -74.1]
+})
+
+db.create_table("my_table", data)
+
+db["my_table"].head()
+```
+
+!!! info "Note"
     Data is converted to Arrow before being written to disk. For maximum control over how data is saved, either provide the PyArrow schema to convert to or else provide a PyArrow Table directly.
 
-    The **`vector`** column needs to be a [Vector](../python/pydantic.md#vector-field) (defined as [pyarrow.FixedSizeList](https://arrow.apache.org/docs/python/generated/pyarrow.list_.html)) type. 
+The **`vector`** column needs to be a [Vector](../python/pydantic.md#vector-field) (defined as [pyarrow.FixedSizeList](https://arrow.apache.org/docs/python/generated/pyarrow.list_.html)) type.
 
-    ```python
-    custom_schema = pa.schema([
-    pa.field("vector", pa.list_(pa.float32(), 4)),
-    pa.field("lat", pa.float32()),
-    pa.field("long", pa.float32())
-    ])
+```python
+custom_schema = pa.schema([
+pa.field("vector", pa.list_(pa.float32(), 4)),
+pa.field("lat", pa.float32()),
+pa.field("long", pa.float32())
+])
 
-    table = db.create_table("my_table", data, schema=custom_schema)
-    ```
+table = db.create_table("my_table", data, schema=custom_schema)
+```
 
 ### From a Polars DataFrame
 
-    LanceDB supports [Polars](https://pola.rs/), a modern, fast DataFrame library
-    written in Rust. Just like in Pandas, the Polars integration is enabled by PyArrow
-    under the hood. A deeper integration between LanceDB Tables and Polars DataFrames
-    is on the way.
+LanceDB supports [Polars](https://pola.rs/), a modern, fast DataFrame library
+written in Rust. Just like in Pandas, the Polars integration is enabled by PyArrow
+under the hood. A deeper integration between LanceDB Tables and Polars DataFrames
+is on the way.
 
-    ```python
-    import polars as pl
+```python
+import polars as pl
 
-    data = pl.DataFrame({
-        "vector": [[3.1, 4.1], [5.9, 26.5]],
-        "item": ["foo", "bar"],
-        "price": [10.0, 20.0]
-    })
-    table = db.create_table("pl_table", data=data)
-    ```
+data = pl.DataFrame({
+    "vector": [[3.1, 4.1], [5.9, 26.5]],
+    "item": ["foo", "bar"],
+    "price": [10.0, 20.0]
+})
+table = db.create_table("pl_table", data=data)
+```
 
 ### From an Arrow Table
+You can also create LanceDB tables directly from Arrow tables.
+LanceDB supports float16 data type!
+
 === "Python"
-    You can also create LanceDB tables directly from Arrow tables. 
-    LanceDB supports float16 data type!
 
     ```python
     import pyarrows as pa
     import numpy as np
-    
+
     dim = 16
     total = 2
     schema = pa.schema(
@@ -160,13 +222,19 @@ This guide will show how to create tables, insert data into them, and update the
     tbl = db.create_table("f16_tbl", data, schema=schema)
     ```
 
-=== "Javascript"
-    You can also create LanceDB tables directly from Arrow tables. 
-    LanceDB supports Float16 data type!
+=== "Typescript[^1]"
 
-    ```javascript
-    --8<-- "docs/src/basic_legacy.ts:create_f16_table"
-    ```
+    === "@lancedb/lancedb"
+
+        ```typescript
+        --8<-- "nodejs/examples/basic.ts:create_f16_table"
+        ```
+
+    === "vectordb (deprecated)"
+
+        ```typescript
+        --8<-- "docs/src/basic_legacy.ts:create_f16_table"
+        ```
 
 ### From Pydantic Models
 
@@ -225,7 +293,7 @@ class NestedSchema(LanceModel):
 tbl = db.create_table("nested_table", schema=NestedSchema, mode="overwrite")
 ```
 
-This creates a struct column called "document" that has two subfields 
+This creates a struct column called "document" that has two subfields
 called "content" and "source":
 
 ```
@@ -236,7 +304,7 @@ vector: fixed_size_list<item: float>[1536] not null
     child 0, item: float
 document: struct<content: string not null, source: string not null> not null
     child 0, content: string not null
-    child 1, source: string not null    
+    child 1, source: string not null
 ```
 
 #### Validators
@@ -261,7 +329,7 @@ class TestModel(LanceModel):
     @classmethod
     def tz_must_match(cls, dt: datetime) -> datetime:
         assert dt.tzinfo == tz
-        return dt        
+        return dt
 
 ok = TestModel(dt_with_tz=datetime.now(tz))
 
@@ -329,25 +397,25 @@ You can also use iterators of other types like Pandas DataFrame or Pylists direc
     tbl = db.open_table("my_table")
     ```
 
-=== "JavaScript"
+=== "Typescript[^1]"
+
     If you forget the name of your table, you can always get a listing of all table names.
 
-    ```javascript
+    ```typescript
     console.log(await db.tableNames());
     ```
 
     Then, you can open any existing tables.
 
-    ```javascript
+    ```typescript
     const tbl = await db.openTable("my_table");
     ```
 
 ## Creating empty table
+You can create an empty table for scenarios where you want to add data to the table later. An example would be when you want to collect data from a stream/external file and then add it to a table in batches.
 
 === "Python"
-    In Python, you can create an empty table for scenarios where you want to add data to the table later. An example would be when you want to collect data from a stream/external file and then add it to a table in batches.
 
-    ```python
 
     An empty table can be initialized via a PyArrow schema.
 
@@ -364,8 +432,8 @@ You can also use iterators of other types like Pandas DataFrame or Pylists direc
     tbl = db.create_table("empty_table_add", schema=schema)
     ```
 
-    Alternatively, you can also use Pydantic to specify the schema for the empty table. Note that we do not 
-    directly import `pydantic` but instead use `lancedb.pydantic` which is a subclass of `pydantic.BaseModel` 
+    Alternatively, you can also use Pydantic to specify the schema for the empty table. Note that we do not
+    directly import `pydantic` but instead use `lancedb.pydantic` which is a subclass of `pydantic.BaseModel`
     that has been extended to support LanceDB specific types like `Vector`.
 
     ```python
@@ -382,9 +450,23 @@ You can also use iterators of other types like Pandas DataFrame or Pylists direc
 
     Once the empty table has been created, you can add data to it via the various methods listed in the [Adding to a table](#adding-to-a-table) section.
 
+=== "Typescript[^1]"
+
+    === "@lancedb/lancedb"
+
+        ```typescript
+        --8<-- "nodejs/examples/basic.ts:create_empty_table"
+        ```
+
+    === "vectordb (deprecated)"
+
+        ```typescript
+        --8<-- "docs/src/basic_legacy.ts:create_empty_table"
+        ```
+
 ## Adding to a table
 
-After a table has been created, you can always add more data to it using the various methods available.
+After a table has been created, you can always add more data to it usind the `add` method
 
 === "Python"
     You can add any of the valid data structures accepted by LanceDB table, i.e, `dict`, `list[dict]`, `pd.DataFrame`, or `Iterator[pa.RecordBatch]`. Below are some examples.
@@ -452,8 +534,27 @@ After a table has been created, you can always add more data to it using the var
     tbl.add(pydantic_model_items)
     ```
 
+    ??? "Ingesting Pydantic models with LanceDB embedding API"
+        When using LanceDB's embedding API, you can add Pydantic models directly to the table. LanceDB will automatically convert the `vector` field to a vector before adding it to the table. You need to specify the default value of `vector` feild as None to allow LanceDB to automatically vectorize the data.
 
-=== "JavaScript"
+        ```python
+        import lancedb
+        from lancedb.pydantic import LanceModel, Vector
+        from lancedb.embeddings import get_registry
+
+        db = lancedb.connect("~/tmp")
+        embed_fcn = get_registry().get("huggingface").create(name="BAAI/bge-small-en-v1.5")
+
+        class Schema(LanceModel):
+            text: str = embed_fcn.SourceField()
+            vector: Vector(embed_fcn.ndims()) = embed_fcn.VectorField(default=None)
+
+        tbl = db.create_table("my_table", schema=Schema, mode="overwrite")
+        models = [Schema(text="hello"), Schema(text="world")]
+        tbl.add(models)
+        ```
+
+=== "Typescript[^1]"
 
     ```javascript
     await tbl.add(
@@ -509,15 +610,15 @@ Use the `delete()` method on tables to delete rows from a table. To choose which
     # 0  3  [5.0, 6.0]
     ```
 
-=== "JavaScript"
+=== "Typescript[^1]"
 
-    ```javascript
+    ```ts
     await tbl.delete('item = "fizz"')
     ```
 
     ### Deleting row with specific column value
 
-    ```javascript
+    ```ts
     const con = await lancedb.connect("./.lancedb")
     const data = [
       {id: 1, vector: [1, 2]},
@@ -531,7 +632,7 @@ Use the `delete()` method on tables to delete rows from a table. To choose which
 
     ### Delete from a list of values
 
-    ```javascript
+    ```ts
     const to_remove = [1, 5];
     await tbl.delete(`id IN (${to_remove.join(",")})`)
     await tbl.countRows() // Returns 1
@@ -588,26 +689,49 @@ This can be used to update zero to all rows depending on how many rows match the
     2  2  [10.0, 10.0]
     ```
 
-=== "JavaScript/Typescript"
+=== "Typescript[^1]"
 
-    API Reference: [vectordb.Table.update](../javascript/interfaces/Table.md/#update)
+    === "@lancedb/lancedb"
 
-    ```javascript
-    const lancedb = require("vectordb");
+        API Reference: [lancedb.Table.update](../js/classes/Table.md/#update)
 
-    const db = await lancedb.connect("./.lancedb");
+        ```ts
+        import * as lancedb from "@lancedb/lancedb";
 
-    const data = [
-      {x: 1, vector: [1, 2]},
-      {x: 2, vector: [3, 4]},
-      {x: 3, vector: [5, 6]},
-    ];
-    const tbl = await db.createTable("my_table", data)
+        const db = await lancedb.connect("./.lancedb");
 
-    await tbl.update({ where: "x = 2", values: {vector: [10, 10]} })
-    ```
+        const data = [
+            {x: 1, vector: [1, 2]},
+            {x: 2, vector: [3, 4]},
+            {x: 3, vector: [5, 6]},
+        ];
+        const tbl = await db.createTable("my_table", data)
 
-The `values` parameter is used to provide the new values for the columns as literal values. You can also use the `values_sql` / `valuesSql` parameter to provide SQL expressions for the new values. For example, you can use `values_sql="x + 1"` to increment the value of the `x` column by 1.
+        await tbl.update({vector: [10, 10]}, { where: "x = 2"})
+        ```
+
+    === "vectordb (deprecated)"
+
+        API Reference: [vectordb.Table.update](../javascript/interfaces/Table.md/#update)
+
+        ```ts
+        const lancedb = require("vectordb");
+
+        const db = await lancedb.connect("./.lancedb");
+
+        const data = [
+            {x: 1, vector: [1, 2]},
+            {x: 2, vector: [3, 4]},
+            {x: 3, vector: [5, 6]},
+        ];
+        const tbl = await db.createTable("my_table", data)
+
+        await tbl.update({ where: "x = 2", values: {vector: [10, 10]} })
+        ```
+
+#### Updating using a sql query
+
+  The `values` parameter is used to provide the new values for the columns as literal values. You can also use the `values_sql` / `valuesSql` parameter to provide SQL expressions for the new values. For example, you can use `values_sql="x + 1"` to increment the value of the `x` column by 1.
 
 === "Python"
 
@@ -626,15 +750,46 @@ The `values` parameter is used to provide the new values for the columns as lite
     2  3  [10.0, 10.0]
     ```
 
-=== "JavaScript/Typescript"
+=== "Typescript[^1]"
 
-    ```javascript
-    await tbl.update({ valuesSql: { x: "x + 1" } })
-    ```
+    === "@lancedb/lancedb"
+
+        Coming Soon!
+
+    === "vectordb (deprecated)"
+
+        ```ts
+        await tbl.update({ valuesSql: { x: "x + 1" } })
+        ```
 
 !!! info "Note"
 
     When rows are updated, they are moved out of the index. The row will still show up in ANN queries, but the query will not be as fast as it would be if the row was in the index. If you update a large proportion of rows, consider rebuilding the index afterwards.
+
+## Drop a table
+
+Use the `drop_table()` method on the database to remove a table.
+
+=== "Python"
+
+      ```python
+      --8<-- "python/python/tests/docs/test_basic.py:drop_table"
+      --8<-- "python/python/tests/docs/test_basic.py:drop_table_async"
+      ```
+
+      This permanently removes the table and is not recoverable, unlike deleting rows.
+      By default, if the table does not exist an exception is raised. To suppress this,
+      you can pass in `ignore_missing=True`.
+
+=== "TypeScript"
+
+      ```typescript
+      --8<-- "docs/src/basic_legacy.ts:drop_table"
+      ```
+
+      This permanently removes the table and is not recoverable, unlike deleting rows.
+      If the table does not exist an exception is raised.
+
 
 ## Consistency
 
@@ -651,7 +806,7 @@ There are three possible settings for `read_consistency_interval`:
     This is only tune-able in LanceDB OSS. In LanceDB Cloud, readers are always eventually consistent.
 
 === "Python"
-    
+
     To set strong consistency, use `timedelta(0)`:
 
     ```python
@@ -673,33 +828,35 @@ There are three possible settings for `read_consistency_interval`:
     ```python
     db = lancedb.connect("./.lancedb")
     table = db.open_table("my_table")
-    
+
     # (Other writes happen to my_table from another process)
 
     # Check for updates
     table.checkout_latest()
     ```
 
-=== "JavaScript/Typescript"
+=== "Typescript[^1]"
 
     To set strong consistency, use `0`:
 
-    ```javascript
+    ```ts
     const db = await lancedb.connect({ uri: "./.lancedb", readConsistencyInterval: 0 });
     const table = await db.openTable("my_table");
     ```
 
     For eventual consistency, specify the update interval as seconds:
 
-    ```javascript
+    ```ts
     const db = await lancedb.connect({ uri: "./.lancedb", readConsistencyInterval: 5 });
     const table = await db.openTable("my_table");
     ```
 
-<!-- Node doesn't yet support the version time travel: https://github.com/lancedb/lancedb/issues/1007 
+<!-- Node doesn't yet support the version time travel: https://github.com/lancedb/lancedb/issues/1007
     Once it does, we can show manual consistency check for Node as well.
 -->
 
 ## What's next?
 
 Learn the best practices on creating an ANN index and getting the most out of it.
+
+[^1]: The `vectordb` package is a legacy package that is  deprecated in favor of `@lancedb/lancedb`.  The `vectordb` package will continue to receive bug fixes and security updates until September 2024.  We recommend all new projects use `@lancedb/lancedb`.  See the [migration guide](migration.md) for more information.

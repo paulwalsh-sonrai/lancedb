@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import os
 from abc import abstractmethod
 from pathlib import Path
@@ -27,17 +26,22 @@ from pyarrow import fs
 from lancedb.common import data_to_reader, validate_schema
 
 from ._lancedb import connect as lancedb_connect
-from .pydantic import LanceModel
-from .table import AsyncTable, LanceTable, Table, _sanitize_data
+from .table import (
+    AsyncTable,
+    LanceTable,
+    Table,
+    _table_path,
+    sanitize_create_table,
+)
 from .util import (
     fs_from_uri,
     get_uri_location,
     get_uri_scheme,
-    join_uri,
     validate_table_name,
 )
 
 if TYPE_CHECKING:
+    from .pydantic import LanceModel
     from datetime import timedelta
 
     from ._lancedb import Connection as LanceDbConnection
@@ -92,7 +96,7 @@ class DBConnection(EnforceOverrides):
             User must provide at least one of `data` or `schema`.
             Acceptable types are:
 
-            - dict or list-of-dict
+            - list-of-dict
 
             - pandas.DataFrame
 
@@ -277,6 +281,10 @@ class DBConnection(EnforceOverrides):
         """
         raise NotImplementedError
 
+    @property
+    def uri(self) -> str:
+        return self._uri
+
 
 class LanceDBConnection(DBConnection):
     """
@@ -340,10 +348,6 @@ class LanceDBConnection(DBConnection):
             val += f", read_consistency_interval={repr(self.read_consistency_interval)}"
         val += ")"
         return val
-
-    @property
-    def uri(self) -> str:
-        return self._uri
 
     async def _async_get_table_names(self, start_after: Optional[str], limit: int):
         conn = AsyncConnection(await lancedb_connect(self.uri))
@@ -457,16 +461,18 @@ class LanceDBConnection(DBConnection):
             If True, ignore if the table does not exist.
         """
         try:
-            filesystem, path = fs_from_uri(self.uri)
-            table_path = join_uri(path, name + ".lance")
-            filesystem.delete_dir(table_path)
+            table_uri = _table_path(self.uri, name)
+            filesystem, path = fs_from_uri(table_uri)
+            filesystem.delete_dir(path)
         except FileNotFoundError:
             if not ignore_missing:
                 raise
 
     @override
     def drop_database(self):
-        filesystem, path = fs_from_uri(self.uri)
+        dummy_table_uri = _table_path(self.uri, "dummy")
+        uri = dummy_table_uri.removesuffix("dummy.lance")
+        filesystem, path = fs_from_uri(uri)
         filesystem.delete_dir(path)
 
 
@@ -509,7 +515,7 @@ class AsyncConnection(object):
         return self._inner.__repr__()
 
     def __enter__(self):
-        self
+        return self
 
     def __exit__(self, *_):
         self.close()
@@ -558,6 +564,10 @@ class AsyncConnection(object):
         on_bad_vectors: Optional[str] = None,
         fill_value: Optional[float] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        *,
+        data_storage_version: Optional[str] = None,
+        use_legacy_format: Optional[bool] = None,
+        enable_v2_manifest_paths: Optional[bool] = None,
     ) -> AsyncTable:
         """Create an [AsyncTable][lancedb.table.AsyncTable] in the database.
 
@@ -569,7 +579,7 @@ class AsyncConnection(object):
             User must provide at least one of `data` or `schema`.
             Acceptable types are:
 
-            - dict or list-of-dict
+            - list-of-dict
 
             - pandas.DataFrame
 
@@ -600,6 +610,22 @@ class AsyncConnection(object):
             connection will be inherited by the table, but can be overridden here.
             See available options at
             https://lancedb.github.io/lancedb/guides/storage/
+        data_storage_version: optional, str, default "stable"
+            The version of the data storage format to use. Newer versions are more
+            efficient but require newer versions of lance to read.  The default is
+            "stable" which will use the legacy v2 version.  See the user guide
+            for more details.
+        use_legacy_format: bool, optional, default False. (Deprecated)
+            If True, use the legacy format for the table. If False, use the new format.
+            This method is deprecated, use `data_storage_version` instead.
+        enable_v2_manifest_paths: bool, optional, default False
+            Use the new V2 manifest paths. These paths provide more efficient
+            opening of datasets with many versions on object stores.  WARNING:
+            turning this on will make the dataset unreadable for older versions
+            of LanceDB (prior to 0.13.0). To migrate an existing dataset, instead
+            use the
+            [AsyncTable.migrate_manifest_paths_v2][lancedb.table.AsyncTable.migrate_manifest_paths_v2]
+            method.
 
 
         Returns
@@ -709,12 +735,6 @@ class AsyncConnection(object):
         ...     await db.create_table("table4", make_batches(), schema=schema)
         >>> asyncio.run(iterable_example())
         """
-        if inspect.isclass(schema) and issubclass(schema, LanceModel):
-            # convert LanceModel to pyarrow schema
-            # note that it's possible this contains
-            # embedding function metadata already
-            schema = schema.to_arrow_schema()
-
         metadata = None
 
         # Defining defaults here and not in function prototype.  In the future
@@ -725,31 +745,9 @@ class AsyncConnection(object):
         if fill_value is None:
             fill_value = 0.0
 
-        if data is not None:
-            data = _sanitize_data(
-                data,
-                schema,
-                metadata=metadata,
-                on_bad_vectors=on_bad_vectors,
-                fill_value=fill_value,
-            )
-
-        if schema is None:
-            if data is None:
-                raise ValueError("Either data or schema must be provided")
-            elif hasattr(data, "schema"):
-                schema = data.schema
-            elif isinstance(data, Iterable):
-                if metadata:
-                    raise TypeError(
-                        (
-                            "Persistent embedding functions not yet "
-                            "supported for generator data input"
-                        )
-                    )
-
-        if metadata:
-            schema = schema.with_metadata(metadata)
+        data, schema = sanitize_create_table(
+            data, schema, metadata, on_bad_vectors, fill_value
+        )
         validate_schema(schema)
 
         if exist_ok is None:
@@ -759,9 +757,17 @@ class AsyncConnection(object):
         if mode == "create" and exist_ok:
             mode = "exist_ok"
 
+        if not data_storage_version:
+            data_storage_version = "legacy" if use_legacy_format else "stable"
+
         if data is None:
             new_table = await self._inner.create_empty_table(
-                name, mode, schema, storage_options=storage_options
+                name,
+                mode,
+                schema,
+                storage_options=storage_options,
+                data_storage_version=data_storage_version,
+                enable_v2_manifest_paths=enable_v2_manifest_paths,
             )
         else:
             data = data_to_reader(data, schema)
@@ -770,6 +776,8 @@ class AsyncConnection(object):
                 mode,
                 data,
                 storage_options=storage_options,
+                data_storage_version=data_storage_version,
+                enable_v2_manifest_paths=enable_v2_manifest_paths,
             )
 
         return AsyncTable(new_table)
@@ -779,7 +787,7 @@ class AsyncConnection(object):
         name: str,
         storage_options: Optional[Dict[str, str]] = None,
         index_cache_size: Optional[int] = None,
-    ) -> Table:
+    ) -> AsyncTable:
         """Open a Lance Table in the database.
 
         Parameters
@@ -808,6 +816,18 @@ class AsyncConnection(object):
         """
         table = await self._inner.open_table(name, storage_options, index_cache_size)
         return AsyncTable(table)
+
+    async def rename_table(self, old_name: str, new_name: str):
+        """Rename a table in the database.
+
+        Parameters
+        ----------
+        old_name: str
+            The current name of the table.
+        new_name: str
+            The new name of the table.
+        """
+        await self._inner.rename_table(old_name, new_name)
 
     async def drop_table(self, name: str):
         """Drop a table from the database.

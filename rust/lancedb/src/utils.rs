@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use lance::dataset::{ReadParams, WriteParams};
 use lance::io::{ObjectStoreParams, WrappingObjectStore};
 use lazy_static::lazy_static;
@@ -101,7 +101,7 @@ pub fn validate_table_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Find one default column to create index.
+/// Find one default column to create index or perform vector query.
 pub(crate) fn default_vector_column(schema: &Schema, dim: Option<i32>) -> Result<String> {
     // Try to find one fixed size list array column.
     let candidates = schema
@@ -118,19 +118,60 @@ pub(crate) fn default_vector_column(schema: &Schema, dim: Option<i32>) -> Result
         })
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        Err(Error::Schema {
-            message: "No vector column found to create index".to_string(),
+        Err(Error::InvalidInput {
+            message: format!(
+                "No vector column found to match with the query vector dimension: {}",
+                dim.unwrap_or_default()
+            ),
         })
     } else if candidates.len() != 1 {
         Err(Error::Schema {
             message: format!(
                 "More than one vector columns found, \
-                    please specify which column to create index: {:?}",
+                    please specify which column to create index or query: {:?}",
                 candidates
             ),
         })
     } else {
         Ok(candidates[0].to_string())
+    }
+}
+
+pub fn supported_btree_data_type(dtype: &DataType) -> bool {
+    dtype.is_integer()
+        || dtype.is_floating()
+        || matches!(
+            dtype,
+            DataType::Boolean
+                | DataType::Utf8
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Timestamp(_, _)
+        )
+}
+
+pub fn supported_bitmap_data_type(dtype: &DataType) -> bool {
+    dtype.is_integer() || matches!(dtype, DataType::Utf8)
+}
+
+pub fn supported_label_list_data_type(dtype: &DataType) -> bool {
+    match dtype {
+        DataType::List(field) => supported_bitmap_data_type(field.data_type()),
+        DataType::FixedSizeList(field, _) => supported_bitmap_data_type(field.data_type()),
+        _ => false,
+    }
+}
+
+pub fn supported_fts_data_type(dtype: &DataType) -> bool {
+    matches!(dtype, DataType::Utf8 | DataType::LargeUtf8)
+}
+
+pub fn supported_vector_data_type(dtype: &DataType) -> bool {
+    match dtype {
+        DataType::FixedSizeList(inner, _) => DataType::is_floating(inner.data_type()),
+        _ => false,
     }
 }
 

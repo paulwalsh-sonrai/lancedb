@@ -22,19 +22,22 @@ use std::sync::Arc;
 use arrow_array::{RecordBatchIterator, RecordBatchReader};
 use arrow_schema::SchemaRef;
 use lance::dataset::{ReadParams, WriteMode};
-use lance::io::{ObjectStore, ObjectStoreParams, WrappingObjectStore};
+use lance::io::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore};
 use object_store::{aws::AwsCredential, local::LocalFileSystem};
 use snafu::prelude::*;
 
 use crate::arrow::IntoArrow;
+use crate::embeddings::{
+    EmbeddingDefinition, EmbeddingFunction, EmbeddingRegistry, MemoryRegistry, WithEmbeddings,
+};
 use crate::error::{CreateDirSnafu, Error, InvalidTableNameSnafu, Result};
 use crate::io::object_store::MirroringObjectStoreWrapper;
-use crate::table::{NativeTable, WriteOptions};
+#[cfg(feature = "remote")]
+use crate::remote::client::ClientConfig;
+use crate::table::{NativeTable, TableDefinition, WriteOptions};
 use crate::utils::validate_table_name;
 use crate::Table;
-
-#[cfg(feature = "remote")]
-use log::warn;
+pub use lance_encoding::version::LanceFileVersion;
 
 pub const LANCE_FILE_EXTENSION: &str = "lance";
 
@@ -133,9 +136,12 @@ pub struct CreateTableBuilder<const HAS_DATA: bool, T: IntoArrow> {
     parent: Arc<dyn ConnectionInternal>,
     pub(crate) name: String,
     pub(crate) data: Option<T>,
-    pub(crate) schema: Option<SchemaRef>,
     pub(crate) mode: CreateTableMode,
     pub(crate) write_options: WriteOptions,
+    pub(crate) table_definition: Option<TableDefinition>,
+    pub(crate) embeddings: Vec<(EmbeddingDefinition, Arc<dyn EmbeddingFunction>)>,
+    pub(crate) data_storage_version: Option<LanceFileVersion>,
+    pub(crate) enable_v2_manifest_paths: Option<bool>,
 }
 
 // Builder methods that only apply when we have initial data
@@ -145,9 +151,12 @@ impl<T: IntoArrow> CreateTableBuilder<true, T> {
             parent,
             name,
             data: Some(data),
-            schema: None,
             mode: CreateTableMode::default(),
             write_options: WriteOptions::default(),
+            table_definition: None,
+            embeddings: Vec::new(),
+            data_storage_version: None,
+            enable_v2_manifest_paths: None,
         }
     }
 
@@ -175,9 +184,12 @@ impl<T: IntoArrow> CreateTableBuilder<true, T> {
             parent: self.parent,
             name: self.name,
             data: None,
-            schema: self.schema,
+            table_definition: self.table_definition,
             mode: self.mode,
             write_options: self.write_options,
+            embeddings: self.embeddings,
+            data_storage_version: self.data_storage_version,
+            enable_v2_manifest_paths: self.enable_v2_manifest_paths,
         };
         Ok((data, builder))
     }
@@ -186,13 +198,17 @@ impl<T: IntoArrow> CreateTableBuilder<true, T> {
 // Builder methods that only apply when we do not have initial data
 impl CreateTableBuilder<false, NoData> {
     fn new(parent: Arc<dyn ConnectionInternal>, name: String, schema: SchemaRef) -> Self {
+        let table_definition = TableDefinition::new_from_schema(schema);
         Self {
             parent,
             name,
             data: None,
-            schema: Some(schema),
+            table_definition: Some(table_definition),
             mode: CreateTableMode::default(),
             write_options: WriteOptions::default(),
+            embeddings: Vec::new(),
+            data_storage_version: None,
+            enable_v2_manifest_paths: None,
         }
     }
 
@@ -254,12 +270,72 @@ impl<const HAS_DATA: bool, T: IntoArrow> CreateTableBuilder<HAS_DATA, T> {
         }
         self
     }
+
+    /// Set whether to use V2 manifest paths for the table. (default: false)
+    ///
+    /// These paths provide more efficient opening of tables with many
+    /// versions on object stores.
+    ///
+    /// <div class="warning">Turning this on will make the dataset unreadable
+    /// for older versions of LanceDB (prior to 0.10.0).</div>
+    ///
+    /// To migrate an existing dataset, instead use the
+    /// [[NativeTable::migrate_manifest_paths_v2]].
+    ///
+    /// This has no effect in LanceDB Cloud.
+    pub fn enable_v2_manifest_paths(mut self, use_v2_manifest_paths: bool) -> Self {
+        self.enable_v2_manifest_paths = Some(use_v2_manifest_paths);
+        self
+    }
+
+    /// Set the data storage version.
+    ///
+    /// The default is `LanceFileVersion::Stable`.
+    pub fn data_storage_version(mut self, data_storage_version: LanceFileVersion) -> Self {
+        self.data_storage_version = Some(data_storage_version);
+        self
+    }
+
+    /// Set to true to use the v1 format for data files
+    ///
+    /// This is set to false by default to enable the stable format.
+    /// This should only be used for experimentation and
+    /// evaluation. This option may be removed in the future releases.
+    #[deprecated(since = "0.9.0", note = "use data_storage_version instead")]
+    pub fn use_legacy_format(mut self, use_legacy_format: bool) -> Self {
+        self.data_storage_version = if use_legacy_format {
+            Some(LanceFileVersion::Legacy)
+        } else {
+            Some(LanceFileVersion::Stable)
+        };
+        self
+    }
+
+    /// Add an embedding definition to the table.
+    ///
+    /// The `embedding_name` must match the name of an embedding function that
+    /// was previously registered with the connection's [`EmbeddingRegistry`].
+    pub fn add_embedding(mut self, definition: EmbeddingDefinition) -> Result<Self> {
+        // Early verification of the embedding name
+        let embedding_func = self
+            .parent
+            .embedding_registry()
+            .get(&definition.embedding_name)
+            .ok_or_else(|| Error::EmbeddingFunctionNotFound {
+                name: definition.embedding_name.clone(),
+                reason: "No embedding function found in the connection's embedding_registry"
+                    .to_string(),
+            })?;
+
+        self.embeddings.push((definition, embedding_func));
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct OpenTableBuilder {
-    parent: Arc<dyn ConnectionInternal>,
-    name: String,
+    pub(crate) parent: Arc<dyn ConnectionInternal>,
+    pub(crate) name: String,
     index_cache_size: u32,
     lance_read_params: Option<ReadParams>,
 }
@@ -350,6 +426,7 @@ impl OpenTableBuilder {
 pub(crate) trait ConnectionInternal:
     Send + Sync + std::fmt::Debug + std::fmt::Display + 'static
 {
+    fn embedding_registry(&self) -> &dyn EmbeddingRegistry;
     async fn table_names(&self, options: TableNamesBuilder) -> Result<Vec<String>>;
     async fn do_create_table(
         &self,
@@ -357,6 +434,7 @@ pub(crate) trait ConnectionInternal:
         data: Box<dyn RecordBatchReader + Send>,
     ) -> Result<Table>;
     async fn do_open_table(&self, options: OpenTableBuilder) -> Result<Table>;
+    async fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()>;
     async fn drop_table(&self, name: &str) -> Result<()>;
     async fn drop_db(&self) -> Result<()>;
 
@@ -366,7 +444,7 @@ pub(crate) trait ConnectionInternal:
     ) -> Result<Table> {
         let batches = Box::new(RecordBatchIterator::new(
             vec![],
-            options.schema.as_ref().unwrap().clone(),
+            options.table_definition.clone().unwrap().schema.clone(),
         ));
         self.do_create_table(options, batches).await
     }
@@ -439,6 +517,19 @@ impl Connection {
         OpenTableBuilder::new(self.internal.clone(), name.into())
     }
 
+    /// Rename a table in the database.
+    ///
+    /// This is only supported in LanceDB Cloud.
+    pub async fn rename_table(
+        &self,
+        old_name: impl AsRef<str>,
+        new_name: impl AsRef<str>,
+    ) -> Result<()> {
+        self.internal
+            .rename_table(old_name.as_ref(), new_name.as_ref())
+            .await
+    }
+
     /// Drop a table in the database.
     ///
     /// # Arguments
@@ -452,6 +543,13 @@ impl Connection {
     /// This is the same as dropping all of the tables
     pub async fn drop_db(&self) -> Result<()> {
         self.internal.drop_db().await
+    }
+
+    /// Get the in-memory embedding registry.
+    /// It's important to note that the embedding registry is not persisted across connections.
+    /// So if a table contains embeddings, you will need to make sure that you are using a connection that has the same embedding functions registered
+    pub fn embedding_registry(&self) -> &dyn EmbeddingRegistry {
+        self.internal.embedding_registry()
     }
 }
 
@@ -472,6 +570,8 @@ pub struct ConnectBuilder {
     region: Option<String>,
     /// LanceDB Cloud host override, only required if using an on-premises Lance Cloud instance
     host_override: Option<String>,
+    #[cfg(feature = "remote")]
+    client_config: ClientConfig,
 
     storage_options: HashMap<String, String>,
 
@@ -486,6 +586,7 @@ pub struct ConnectBuilder {
     /// consistency only applies to read operations. Write operations are
     /// always consistent.
     read_consistency_interval: Option<std::time::Duration>,
+    embedding_registry: Option<Arc<dyn EmbeddingRegistry>>,
 }
 
 impl ConnectBuilder {
@@ -496,8 +597,11 @@ impl ConnectBuilder {
             api_key: None,
             region: None,
             host_override: None,
+            #[cfg(feature = "remote")]
+            client_config: Default::default(),
             read_consistency_interval: None,
             storage_options: HashMap::new(),
+            embedding_registry: None,
         }
     }
 
@@ -513,6 +617,36 @@ impl ConnectBuilder {
 
     pub fn host_override(mut self, host_override: &str) -> Self {
         self.host_override = Some(host_override.to_string());
+        self
+    }
+
+    /// Set the LanceDB Cloud client configuration.
+    ///
+    /// ```
+    /// # use lancedb::connect;
+    /// # use lancedb::remote::*;
+    /// connect("db://my_database")
+    ///    .client_config(ClientConfig {
+    ///      timeout_config: TimeoutConfig {
+    ///        connect_timeout: Some(std::time::Duration::from_secs(5)),
+    ///        ..Default::default()
+    ///      },
+    ///      retry_config: RetryConfig {
+    ///        retries: Some(5),
+    ///        ..Default::default()
+    ///      },
+    ///      ..Default::default()
+    ///    });
+    /// ```
+    #[cfg(feature = "remote")]
+    pub fn client_config(mut self, config: ClientConfig) -> Self {
+        self.client_config = config;
+        self
+    }
+
+    /// Provide a custom [`EmbeddingRegistry`] to use for this connection.
+    pub fn embedding_registry(mut self, registry: Arc<dyn EmbeddingRegistry>) -> Self {
+        self.embedding_registry = Some(registry);
         self
     }
 
@@ -582,12 +716,13 @@ impl ConnectBuilder {
         let api_key = self.api_key.ok_or_else(|| Error::InvalidInput {
             message: "An api_key is required when connecting to LanceDb Cloud".to_string(),
         })?;
-        warn!("The rust implementation of the remote client is not yet ready for use.");
+
         let internal = Arc::new(crate::remote::db::RemoteDatabase::try_new(
             &self.uri,
             &api_key,
             &region,
             self.host_override,
+            self.client_config,
         )?);
         Ok(Connection {
             internal,
@@ -642,6 +777,7 @@ struct Database {
 
     // Storage options to be inherited by tables created from this connection
     storage_options: HashMap<String, String>,
+    embedding_registry: Arc<dyn EmbeddingRegistry>,
 }
 
 impl std::fmt::Display for Database {
@@ -675,7 +811,12 @@ impl Database {
         // TODO: pass params regardless of OS
         match parse_res {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
-                Self::open_path(uri, options.read_consistency_interval).await
+                Self::open_path(
+                    uri,
+                    options.read_consistency_interval,
+                    options.embedding_registry.clone(),
+                )
+                .await
             }
             Ok(mut url) => {
                 // iter thru the query params and extract the commit store param
@@ -725,13 +866,14 @@ impl Database {
 
                 let plain_uri = url.to_string();
 
+                let registry = Arc::new(ObjectStoreRegistry::default());
                 let storage_options = options.storage_options.clone();
                 let os_params = ObjectStoreParams {
                     storage_options: Some(storage_options.clone()),
                     ..Default::default()
                 };
                 let (object_store, base_path) =
-                    ObjectStore::from_uri_and_params(&plain_uri, &os_params).await?;
+                    ObjectStore::from_uri_and_params(registry, &plain_uri, &os_params).await?;
                 if object_store.is_local() {
                     Self::try_create_dir(&plain_uri).context(CreateDirSnafu { path: plain_uri })?;
                 }
@@ -745,6 +887,10 @@ impl Database {
                     None => None,
                 };
 
+                let embedding_registry = options
+                    .embedding_registry
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(MemoryRegistry::new()));
                 Ok(Self {
                     uri: table_base_uri,
                     query_string,
@@ -753,20 +899,33 @@ impl Database {
                     store_wrapper: write_store_wrapper,
                     read_consistency_interval: options.read_consistency_interval,
                     storage_options,
+                    embedding_registry,
                 })
             }
-            Err(_) => Self::open_path(uri, options.read_consistency_interval).await,
+            Err(_) => {
+                Self::open_path(
+                    uri,
+                    options.read_consistency_interval,
+                    options.embedding_registry.clone(),
+                )
+                .await
+            }
         }
     }
 
     async fn open_path(
         path: &str,
         read_consistency_interval: Option<std::time::Duration>,
+        embedding_registry: Option<Arc<dyn EmbeddingRegistry>>,
     ) -> Result<Self> {
         let (object_store, base_path) = ObjectStore::from_uri(path).await?;
         if object_store.is_local() {
             Self::try_create_dir(path).context(CreateDirSnafu { path })?;
         }
+
+        let embedding_registry =
+            embedding_registry.unwrap_or_else(|| Arc::new(MemoryRegistry::new()));
+
         Ok(Self {
             uri: path.to_string(),
             query_string: None,
@@ -775,6 +934,7 @@ impl Database {
             store_wrapper: None,
             read_consistency_interval,
             storage_options: HashMap::new(),
+            embedding_registry,
         })
     }
 
@@ -815,6 +975,9 @@ impl Database {
 
 #[async_trait::async_trait]
 impl ConnectionInternal for Database {
+    fn embedding_registry(&self) -> &dyn EmbeddingRegistry {
+        self.embedding_registry.as_ref()
+    }
     async fn table_names(&self, options: TableNamesBuilder) -> Result<Vec<String>> {
         let mut f = self
             .object_store
@@ -851,7 +1014,7 @@ impl ConnectionInternal for Database {
         data: Box<dyn RecordBatchReader + Send>,
     ) -> Result<Table> {
         let table_uri = self.table_uri(&options.name)?;
-
+        let embedding_registry = self.embedding_registry.clone();
         // Inherit storage options from the connection
         let storage_options = options
             .write_options
@@ -866,11 +1029,20 @@ impl ConnectionInternal for Database {
                 storage_options.insert(key.clone(), value.clone());
             }
         }
+        let data = if options.embeddings.is_empty() {
+            data
+        } else {
+            Box::new(WithEmbeddings::new(data, options.embeddings))
+        };
 
         let mut write_params = options.write_options.lance_write_params.unwrap_or_default();
         if matches!(&options.mode, CreateTableMode::Overwrite) {
             write_params.mode = WriteMode::Overwrite;
         }
+
+        write_params.data_storage_version = options.data_storage_version;
+        write_params.enable_v2_manifest_paths =
+            options.enable_v2_manifest_paths.unwrap_or_default();
 
         match NativeTable::create(
             &table_uri,
@@ -882,7 +1054,10 @@ impl ConnectionInternal for Database {
         )
         .await
         {
-            Ok(table) => Ok(Table::new(Arc::new(table))),
+            Ok(table) => Ok(Table::new_with_embedding_registry(
+                Arc::new(table),
+                embedding_registry,
+            )),
             Err(Error::TableAlreadyExists { name }) => match options.mode {
                 CreateTableMode::Create => Err(Error::TableAlreadyExists { name }),
                 CreateTableMode::ExistOk(callback) => {
@@ -937,6 +1112,12 @@ impl ConnectionInternal for Database {
         Ok(Table::new(native_table))
     }
 
+    async fn rename_table(&self, _old_name: &str, _new_name: &str) -> Result<()> {
+        Err(Error::NotSupported {
+            message: "rename_table is not supported in LanceDB OSS".to_string(),
+        })
+    }
+
     async fn drop_table(&self, name: &str) -> Result<()> {
         let dir_name = format!("{}.{}", name, LANCE_EXTENSION);
         let full_path = self.base_path.child(dir_name.clone());
@@ -962,10 +1143,33 @@ impl ConnectionInternal for Database {
     }
 }
 
+#[cfg(all(test, feature = "remote"))]
+mod test_utils {
+    use super::*;
+    impl Connection {
+        pub fn new_with_handler<T>(
+            handler: impl Fn(reqwest::Request) -> http::Response<T> + Clone + Send + Sync + 'static,
+        ) -> Self
+        where
+            T: Into<reqwest::Body>,
+        {
+            let internal = Arc::new(crate::remote::db::RemoteDatabase::new_mock(handler));
+            Self {
+                internal,
+                uri: "db://test".to_string(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field, Schema};
+    use futures::TryStreamExt;
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use tempfile::tempdir;
+
+    use crate::query::{ExecutableQuery, QueryExecutionOptions};
 
     use super::*;
 
@@ -1069,6 +1273,61 @@ mod tests {
         db.open_table("table1").execute().await.unwrap();
         let tables = db.table_names().execute().await.unwrap();
         assert_eq!(tables, vec!["table1".to_owned()]);
+    }
+
+    fn make_data() -> Box<dyn RecordBatchReader + Send + 'static> {
+        let id = Box::new(IncrementingInt32::new().named("id".to_string()));
+        Box::new(BatchGenerator::new().col(id).batches(10, 2000))
+    }
+
+    #[tokio::test]
+    async fn test_create_table_v2() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+        let db = connect(uri).execute().await.unwrap();
+
+        let tbl = db
+            .create_table("v1_test", make_data())
+            .data_storage_version(LanceFileVersion::Legacy)
+            .execute()
+            .await
+            .unwrap();
+
+        // In v1 the row group size will trump max_batch_length
+        let batches = tbl
+            .query()
+            .execute_with_options(QueryExecutionOptions {
+                max_batch_length: 50000,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 20);
+
+        let tbl = db
+            .create_table("v2_test", make_data())
+            .data_storage_version(LanceFileVersion::Stable)
+            .execute()
+            .await
+            .unwrap();
+
+        // In v2 the page size is much bigger than 50k so we should get a single batch
+        let batches = tbl
+            .query()
+            .execute_with_options(QueryExecutionOptions {
+                max_batch_length: 50000,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
     }
 
     #[tokio::test]

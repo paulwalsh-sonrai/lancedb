@@ -18,7 +18,6 @@ import lancedb
 import numpy as np
 import pandas as pd
 import pytest
-import requests
 from lancedb.embeddings import get_registry
 from lancedb.pydantic import LanceModel, Vector
 
@@ -45,7 +44,9 @@ except Exception:
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("alias", ["sentence-transformers", "openai", "huggingface"])
+@pytest.mark.parametrize(
+    "alias", ["sentence-transformers", "openai", "huggingface", "ollama"]
+)
 def test_basic_text_embeddings(alias, tmp_path):
     db = lancedb.connect(tmp_path)
     registry = get_registry()
@@ -106,6 +107,7 @@ def test_basic_text_embeddings(alias, tmp_path):
 
 @pytest.mark.slow
 def test_openclip(tmp_path):
+    import requests
     from PIL import Image
 
     db = lancedb.connect(tmp_path)
@@ -415,3 +417,86 @@ def test_openai_embedding(tmp_path):
     tbl.add(df)
     assert len(tbl.to_pandas()["vector"][0]) == model.ndims()
     assert tbl.search("hello").limit(1).to_pandas()["text"][0] == "hello world"
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    os.environ.get("WATSONX_API_KEY") is None
+    or os.environ.get("WATSONX_PROJECT_ID") is None,
+    reason="WATSONX_API_KEY and WATSONX_PROJECT_ID not set",
+)
+def test_watsonx_embedding(tmp_path):
+    from lancedb.embeddings import WatsonxEmbeddings
+
+    for name in WatsonxEmbeddings.model_names():
+        model = get_registry().get("watsonx").create(max_retries=0, name=name)
+
+        class TextModel(LanceModel):
+            text: str = model.SourceField()
+            vector: Vector(model.ndims()) = model.VectorField()
+
+        db = lancedb.connect("~/.lancedb")
+        tbl = db.create_table("watsonx_test", schema=TextModel, mode="overwrite")
+        df = pd.DataFrame({"text": ["hello world", "goodbye world"]})
+
+        tbl.add(df)
+        assert len(tbl.to_pandas()["vector"][0]) == model.ndims()
+        assert tbl.search("hello").limit(1).to_pandas()["text"][0] == "hello world"
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    importlib.util.find_spec("ollama") is None, reason="Ollama not installed"
+)
+def test_ollama_embedding(tmp_path):
+    model = get_registry().get("ollama").create(max_retries=0)
+
+    class TextModel(LanceModel):
+        text: str = model.SourceField()
+        vector: Vector(model.ndims()) = model.VectorField()
+
+    df = pd.DataFrame({"text": ["hello world", "goodbye world"]})
+    db = lancedb.connect(tmp_path)
+    tbl = db.create_table("test", schema=TextModel, mode="overwrite")
+
+    tbl.add(df)
+
+    assert len(tbl.to_pandas()["vector"][0]) == model.ndims()
+
+    result = tbl.search("hello").limit(1).to_pandas()
+    assert result["text"][0] == "hello world"
+
+    # Test safe_model_dump
+    dumped_model = model.safe_model_dump()
+    assert isinstance(dumped_model, dict)
+    assert "name" in dumped_model
+    assert "max_retries" in dumped_model
+    assert dumped_model["max_retries"] == 0
+    assert all(not k.startswith("_") for k in dumped_model.keys())
+
+    # Test serialization of the dumped model
+    import json
+
+    try:
+        json.dumps(dumped_model)
+    except TypeError:
+        pytest.fail("Failed to JSON serialize the dumped model")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    os.environ.get("VOYAGE_API_KEY") is None, reason="VOYAGE_API_KEY not set"
+)
+def test_voyageai_embedding_function():
+    voyageai = get_registry().get("voyageai").create(name="voyage-3", max_retries=0)
+
+    class TextModel(LanceModel):
+        text: str = voyageai.SourceField()
+        vector: Vector(voyageai.ndims()) = voyageai.VectorField()
+
+    df = pd.DataFrame({"text": ["hello world", "goodbye world"]})
+    db = lancedb.connect("~/lancedb")
+    tbl = db.create_table("test", schema=TextModel, mode="overwrite")
+
+    tbl.add(df)
+    assert len(tbl.to_pandas()["vector"][0]) == voyageai.ndims()

@@ -12,18 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { Schema, tableFromIPC } from "apache-arrow";
+import {
+  Table as ArrowTable,
+  Data,
+  IntoVector,
+  Schema,
+  TableLike,
+  fromDataToBuffer,
+  fromTableToBuffer,
+  fromTableToStreamBuffer,
+  isArrowTable,
+  makeArrowTable,
+  tableFromIPC,
+} from "./arrow";
+import { CreateTableOptions } from "./connection";
+
+import { EmbeddingFunctionConfig, getRegistry } from "./embedding/registry";
+import { IndexOptions } from "./indices";
+import { MergeInsertBuilder } from "./merge";
 import {
   AddColumnsSql,
   ColumnAlteration,
   IndexConfig,
+  IndexStatistics,
+  OptimizeStats,
   Table as _NativeTable,
 } from "./native";
 import { Query, VectorQuery } from "./query";
-import { IndexOptions } from "./indices";
-import { Data, fromDataToBuffer } from "./arrow";
-
+import { sanitizeTable } from "./sanitize";
+import { IntoSql, toSQL } from "./util";
 export { IndexConfig } from "./native";
+
 /**
  * Options for adding data to a table.
  */
@@ -50,6 +69,24 @@ export interface UpdateOptions {
   where: string;
 }
 
+export interface OptimizeOptions {
+  /**
+   * If set then all versions older than the given date
+   * be removed.  The current version will never be removed.
+   * The default is 7 days
+   * @example
+   * // Delete all versions older than 1 day
+   * const olderThan = new Date();
+   * olderThan.setDate(olderThan.getDate() - 1));
+   * tbl.cleanupOlderVersions(olderThan);
+   *
+   * // Delete all versions except the current version
+   * tbl.cleanupOlderVersions(new Date());
+   */
+  cleanupOlderThan: Date;
+  deleteUnverified: boolean;
+}
+
 /**
  * A Table is a collection of Records in a LanceDB Database.
  *
@@ -62,19 +99,15 @@ export interface UpdateOptions {
  * Closing a table is optional.  It not closed, it will be closed when it is garbage
  * collected.
  */
-export class Table {
-  private readonly inner: _NativeTable;
-
-  /** Construct a Table. Internal use only. */
-  constructor(inner: _NativeTable) {
-    this.inner = inner;
+export abstract class Table {
+  [Symbol.for("nodejs.util.inspect.custom")](): string {
+    return this.display();
   }
+  /** Returns the name of the table */
+  abstract get name(): string;
 
   /** Return true if the table has not been closed */
-  isOpen(): boolean {
-    return this.inner.isOpen();
-  }
-
+  abstract isOpen(): boolean;
   /**
    * Close the table, releasing any underlying resources.
    *
@@ -82,33 +115,44 @@ export class Table {
    *
    * Any attempt to use the table after it is closed will result in an error.
    */
-  close(): void {
-    this.inner.close();
-  }
-
+  abstract close(): void;
   /** Return a brief description of the table */
-  display(): string {
-    return this.inner.display();
-  }
-
+  abstract display(): string;
   /** Get the schema of the table. */
-  async schema(): Promise<Schema> {
-    const schemaBuf = await this.inner.schema();
-    const tbl = tableFromIPC(schemaBuf);
-    return tbl.schema;
-  }
-
+  abstract schema(): Promise<Schema>;
   /**
    * Insert records into this Table.
    * @param {Data} data Records to be inserted into the Table
    */
-  async add(data: Data, options?: Partial<AddDataOptions>): Promise<void> {
-    const mode = options?.mode ?? "append";
-
-    const buffer = await fromDataToBuffer(data);
-    await this.inner.add(buffer, mode);
-  }
-
+  abstract add(data: Data, options?: Partial<AddDataOptions>): Promise<void>;
+  /**
+   * Update existing records in the Table
+   * @param opts.values The values to update. The keys are the column names and the values
+   * are the values to set.
+   * @example
+   * ```ts
+   * table.update({where:"x = 2", values:{"vector": [10, 10]}})
+   * ```
+   */
+  abstract update(
+    opts: {
+      values: Map<string, IntoSql> | Record<string, IntoSql>;
+    } & Partial<UpdateOptions>,
+  ): Promise<void>;
+  /**
+   * Update existing records in the Table
+   * @param opts.valuesSql The values to update. The keys are the column names and the values
+   * are the values to set. The values are SQL expressions.
+   * @example
+   * ```ts
+   * table.update({where:"x = 2", valuesSql:{"x": "x + 1"}})
+   * ```
+   */
+  abstract update(
+    opts: {
+      valuesSql: Map<string, string> | Record<string, string>;
+    } & Partial<UpdateOptions>,
+  ): Promise<void>;
   /**
    * Update existing records in the Table
    *
@@ -134,30 +178,15 @@ export class Table {
    * @param {Partial<UpdateOptions>} options - additional options to control
    * the update behavior
    */
-  async update(
+  abstract update(
     updates: Map<string, string> | Record<string, string>,
     options?: Partial<UpdateOptions>,
-  ) {
-    const onlyIf = options?.where;
-    let columns: [string, string][];
-    if (updates instanceof Map) {
-      columns = Array.from(updates.entries());
-    } else {
-      columns = Object.entries(updates);
-    }
-    await this.inner.update(onlyIf, columns);
-  }
+  ): Promise<void>;
 
   /** Count the total number of rows in the dataset. */
-  async countRows(filter?: string): Promise<number> {
-    return await this.inner.countRows(filter);
-  }
-
+  abstract countRows(filter?: string): Promise<number>;
   /** Delete the rows that satisfy the predicate. */
-  async delete(predicate: string): Promise<void> {
-    await this.inner.delete(predicate);
-  }
-
+  abstract delete(predicate: string): Promise<void>;
   /**
    * Create an index to speed up queries.
    *
@@ -165,6 +194,9 @@ export class Table {
    * Indices on vector columns will speed up vector searches.
    * Indices on scalar columns will speed up filtering (in both
    * vector and non-vector searches)
+   *
+   * @note We currently don't support custom named indexes,
+   * The index name will always be `${column}_idx`
    * @example
    * // If the column has a vector (fixed size list) data type then
    * // an IvfPq vector index will be created.
@@ -184,13 +216,10 @@ export class Table {
    * // Or create a Scalar index
    * await table.createIndex("my_float_col");
    */
-  async createIndex(column: string, options?: Partial<IndexOptions>) {
-    // Bit of a hack to get around the fact that TS has no package-scope.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const nativeIndex = (options?.config as any)?.inner;
-    await this.inner.createIndex(nativeIndex, column, options?.replace);
-  }
-
+  abstract createIndex(
+    column: string,
+    options?: Partial<IndexOptions>,
+  ): Promise<void>;
   /**
    * Create a {@link Query} Builder.
    *
@@ -241,10 +270,24 @@ export class Table {
    * }
    * @returns {Query} A builder that can be used to parameterize the query
    */
-  query(): Query {
-    return new Query(this.inner);
-  }
+  abstract query(): Query;
 
+  /**
+   * Create a search query to find the nearest neighbors
+   * of the given query
+   * @param {string | IntoVector} query - the query, a vector or string
+   * @param {string} queryType - the type of the query, "vector", "fts", or "auto"
+   * @param {string | string[]} ftsColumns - the columns to search in for full text search
+   *    for now, only one column can be searched at a time.
+   *
+   * when "auto" is used, if the query is a string and an embedding function is defined, it will be treated as a vector query
+   * if the query is a string and no embedding function is defined, it will be treated as a full text search query
+   */
+  abstract search(
+    query: string | IntoVector,
+    queryType?: string,
+    ftsColumns?: string | string[],
+  ): VectorQuery | Query;
   /**
    * Search the table with a given query vector.
    *
@@ -252,11 +295,7 @@ export class Table {
    * is the same thing as calling `nearestTo` on the builder returned
    * by `query`.  @see {@link Query#nearestTo} for more details.
    */
-  vectorSearch(vector: unknown): VectorQuery {
-    return this.query().nearestTo(vector);
-  }
-
-  // TODO: Support BatchUDF
+  abstract vectorSearch(vector: IntoVector): VectorQuery;
   /**
    * Add new columns with defined values.
    * @param {AddColumnsSql[]} newColumnTransforms pairs of column names and
@@ -264,19 +303,14 @@ export class Table {
    * expressions will be evaluated for each row in the table, and can
    * reference existing columns in the table.
    */
-  async addColumns(newColumnTransforms: AddColumnsSql[]): Promise<void> {
-    await this.inner.addColumns(newColumnTransforms);
-  }
+  abstract addColumns(newColumnTransforms: AddColumnsSql[]): Promise<void>;
 
   /**
    * Alter the name or nullability of columns.
    * @param {ColumnAlteration[]} columnAlterations One or more alterations to
    * apply to columns.
    */
-  async alterColumns(columnAlterations: ColumnAlteration[]): Promise<void> {
-    await this.inner.alterColumns(columnAlterations);
-  }
-
+  abstract alterColumns(columnAlterations: ColumnAlteration[]): Promise<void>;
   /**
    * Drop one or more columns from the dataset
    *
@@ -288,15 +322,10 @@ export class Table {
    * be nested column references (e.g. "a.b.c") or top-level column names
    * (e.g. "a").
    */
-  async dropColumns(columnNames: string[]): Promise<void> {
-    await this.inner.dropColumns(columnNames);
-  }
-
+  abstract dropColumns(columnNames: string[]): Promise<void>;
   /** Retrieve the version of the table */
-  async version(): Promise<number> {
-    return await this.inner.version();
-  }
 
+  abstract version(): Promise<number>;
   /**
    * Checks out a specific version of the table _This is an in-place operation._
    *
@@ -322,19 +351,14 @@ export class Table {
    * console.log(await table.version()); // 2
    * ```
    */
-  async checkout(version: number): Promise<void> {
-    await this.inner.checkout(version);
-  }
-
+  abstract checkout(version: number): Promise<void>;
   /**
    * Checkout the latest version of the table. _This is an in-place operation._
    *
    * The table will be set back into standard mode, and will track the latest
    * version of the table.
    */
-  async checkoutLatest(): Promise<void> {
-    await this.inner.checkoutLatest();
-  }
+  abstract checkoutLatest(): Promise<void>;
 
   /**
    * Restore the table to the currently checked out version
@@ -348,12 +372,356 @@ export class Table {
    * Once the operation concludes the table will no longer be in a checked
    * out state and the read_consistency_interval, if any, will apply.
    */
+  abstract restore(): Promise<void>;
+  /**
+   * Optimize the on-disk data and indices for better performance.
+   *
+   * Modeled after ``VACUUM`` in PostgreSQL.
+   *
+   *  Optimization covers three operations:
+   *
+   *  - Compaction: Merges small files into larger ones
+   *  - Prune: Removes old versions of the dataset
+   *  - Index: Optimizes the indices, adding new data to existing indices
+   *
+   *
+   *  Experimental API
+   *  ----------------
+   *
+   *  The optimization process is undergoing active development and may change.
+   *  Our goal with these changes is to improve the performance of optimization and
+   *  reduce the complexity.
+   *
+   *  That being said, it is essential today to run optimize if you want the best
+   *  performance.  It should be stable and safe to use in production, but it our
+   *  hope that the API may be simplified (or not even need to be called) in the
+   *  future.
+   *
+   *  The frequency an application shoudl call optimize is based on the frequency of
+   *  data modifications.  If data is frequently added, deleted, or updated then
+   *  optimize should be run frequently.  A good rule of thumb is to run optimize if
+   *  you have added or modified 100,000 or more records or run more than 20 data
+   *  modification operations.
+   */
+  abstract optimize(options?: Partial<OptimizeOptions>): Promise<OptimizeStats>;
+  /** List all indices that have been created with {@link Table.createIndex} */
+  abstract listIndices(): Promise<IndexConfig[]>;
+  /** Return the table as an arrow table */
+  abstract toArrow(): Promise<ArrowTable>;
+
+  abstract mergeInsert(on: string | string[]): MergeInsertBuilder;
+
+  /** List all the stats of a specified index
+   *
+   * @param {string} name The name of the index.
+   * @returns {IndexStatistics | undefined} The stats of the index. If the index does not exist, it will return undefined
+   */
+  abstract indexStats(name: string): Promise<IndexStatistics | undefined>;
+
+  static async parseTableData(
+    data: Record<string, unknown>[] | TableLike,
+    options?: Partial<CreateTableOptions>,
+    streaming = false,
+  ) {
+    let mode: string = options?.mode ?? "create";
+    const existOk = options?.existOk ?? false;
+
+    if (mode === "create" && existOk) {
+      mode = "exist_ok";
+    }
+
+    let table: ArrowTable;
+    if (isArrowTable(data)) {
+      table = sanitizeTable(data);
+    } else {
+      table = makeArrowTable(data as Record<string, unknown>[], options);
+    }
+    if (streaming) {
+      const buf = await fromTableToStreamBuffer(
+        table,
+        options?.embeddingFunction,
+        options?.schema,
+      );
+      return { buf, mode };
+    } else {
+      const buf = await fromTableToBuffer(
+        table,
+        options?.embeddingFunction,
+        options?.schema,
+      );
+      return { buf, mode };
+    }
+  }
+}
+
+export class LocalTable extends Table {
+  private readonly inner: _NativeTable;
+
+  constructor(inner: _NativeTable) {
+    super();
+    this.inner = inner;
+  }
+  get name(): string {
+    return this.inner.name;
+  }
+  isOpen(): boolean {
+    return this.inner.isOpen();
+  }
+
+  close(): void {
+    this.inner.close();
+  }
+
+  display(): string {
+    return this.inner.display();
+  }
+
+  private async getEmbeddingFunctions(): Promise<
+    Map<string, EmbeddingFunctionConfig>
+  > {
+    const schema = await this.schema();
+    const registry = getRegistry();
+    return registry.parseFunctions(schema.metadata);
+  }
+
+  /** Get the schema of the table. */
+  async schema(): Promise<Schema> {
+    const schemaBuf = await this.inner.schema();
+    const tbl = tableFromIPC(schemaBuf);
+    return tbl.schema;
+  }
+
+  async add(data: Data, options?: Partial<AddDataOptions>): Promise<void> {
+    const mode = options?.mode ?? "append";
+    const schema = await this.schema();
+    const registry = getRegistry();
+    const functions = await registry.parseFunctions(schema.metadata);
+
+    const buffer = await fromDataToBuffer(
+      data,
+      functions.values().next().value,
+      schema,
+    );
+    await this.inner.add(buffer, mode);
+  }
+
+  async update(
+    optsOrUpdates:
+      | (Map<string, string> | Record<string, string>)
+      | ({
+          values: Map<string, IntoSql> | Record<string, IntoSql>;
+        } & Partial<UpdateOptions>)
+      | ({
+          valuesSql: Map<string, string> | Record<string, string>;
+        } & Partial<UpdateOptions>),
+    options?: Partial<UpdateOptions>,
+  ) {
+    const isValues =
+      "values" in optsOrUpdates && typeof optsOrUpdates.values !== "string";
+    const isValuesSql =
+      "valuesSql" in optsOrUpdates &&
+      typeof optsOrUpdates.valuesSql !== "string";
+    const isMap = (obj: unknown): obj is Map<string, string> => {
+      return obj instanceof Map;
+    };
+
+    let predicate;
+    let columns: [string, string][];
+    switch (true) {
+      case isMap(optsOrUpdates):
+        columns = Array.from(optsOrUpdates.entries());
+        predicate = options?.where;
+        break;
+      case isValues && isMap(optsOrUpdates.values):
+        columns = Array.from(optsOrUpdates.values.entries()).map(([k, v]) => [
+          k,
+          toSQL(v),
+        ]);
+        predicate = optsOrUpdates.where;
+        break;
+      case isValues && !isMap(optsOrUpdates.values):
+        columns = Object.entries(optsOrUpdates.values).map(([k, v]) => [
+          k,
+          toSQL(v),
+        ]);
+        predicate = optsOrUpdates.where;
+        break;
+
+      case isValuesSql && isMap(optsOrUpdates.valuesSql):
+        columns = Array.from(optsOrUpdates.valuesSql.entries());
+        predicate = optsOrUpdates.where;
+        break;
+      case isValuesSql && !isMap(optsOrUpdates.valuesSql):
+        columns = Object.entries(optsOrUpdates.valuesSql).map(([k, v]) => [
+          k,
+          v,
+        ]);
+        predicate = optsOrUpdates.where;
+        break;
+      default:
+        columns = Object.entries(optsOrUpdates as Record<string, string>);
+        predicate = options?.where;
+    }
+    await this.inner.update(predicate, columns);
+  }
+
+  async countRows(filter?: string): Promise<number> {
+    return await this.inner.countRows(filter);
+  }
+
+  async delete(predicate: string): Promise<void> {
+    await this.inner.delete(predicate);
+  }
+
+  async createIndex(column: string, options?: Partial<IndexOptions>) {
+    // Bit of a hack to get around the fact that TS has no package-scope.
+    // biome-ignore lint/suspicious/noExplicitAny: skip
+    const nativeIndex = (options?.config as any)?.inner;
+    await this.inner.createIndex(nativeIndex, column, options?.replace);
+  }
+
+  query(): Query {
+    return new Query(this.inner);
+  }
+
+  search(
+    query: string | IntoVector,
+    queryType: string = "auto",
+    ftsColumns?: string | string[],
+  ): VectorQuery | Query {
+    if (typeof query !== "string") {
+      if (queryType === "fts") {
+        throw new Error("Cannot perform full text search on a vector query");
+      }
+      return this.vectorSearch(query);
+    }
+
+    // If the query is a string, we need to determine if it is a vector query or a full text search query
+    if (queryType === "fts") {
+      return this.query().fullTextSearch(query, {
+        columns: ftsColumns,
+      });
+    }
+
+    // The query type is auto or vector
+    // fall back to full text search if no embedding functions are defined and the query is a string
+    if (queryType === "auto" && getRegistry().length() === 0) {
+      return this.query().fullTextSearch(query, {
+        columns: ftsColumns,
+      });
+    }
+
+    const queryPromise = this.getEmbeddingFunctions().then(
+      async (functions) => {
+        // TODO: Support multiple embedding functions
+        const embeddingFunc: EmbeddingFunctionConfig | undefined = functions
+          .values()
+          .next().value;
+        if (!embeddingFunc) {
+          return Promise.reject(
+            new Error("No embedding functions are defined in the table"),
+          );
+        }
+        return await embeddingFunc.function.computeQueryEmbeddings(query);
+      },
+    );
+
+    return this.query().nearestTo(queryPromise);
+  }
+
+  vectorSearch(vector: IntoVector): VectorQuery {
+    return this.query().nearestTo(vector);
+  }
+
+  // TODO: Support BatchUDF
+
+  async addColumns(newColumnTransforms: AddColumnsSql[]): Promise<void> {
+    await this.inner.addColumns(newColumnTransforms);
+  }
+
+  async alterColumns(columnAlterations: ColumnAlteration[]): Promise<void> {
+    await this.inner.alterColumns(columnAlterations);
+  }
+
+  async dropColumns(columnNames: string[]): Promise<void> {
+    await this.inner.dropColumns(columnNames);
+  }
+
+  async version(): Promise<number> {
+    return await this.inner.version();
+  }
+
+  async checkout(version: number): Promise<void> {
+    await this.inner.checkout(version);
+  }
+
+  async checkoutLatest(): Promise<void> {
+    await this.inner.checkoutLatest();
+  }
+
   async restore(): Promise<void> {
     await this.inner.restore();
   }
 
-  /** List all indices that have been created with {@link Table.createIndex} */
+  async optimize(options?: Partial<OptimizeOptions>): Promise<OptimizeStats> {
+    let cleanupOlderThanMs;
+    if (
+      options?.cleanupOlderThan !== undefined &&
+      options?.cleanupOlderThan !== null
+    ) {
+      cleanupOlderThanMs =
+        new Date().getTime() - options.cleanupOlderThan.getTime();
+    }
+    return await this.inner.optimize(
+      cleanupOlderThanMs,
+      options?.deleteUnverified,
+    );
+  }
+
   async listIndices(): Promise<IndexConfig[]> {
     return await this.inner.listIndices();
+  }
+
+  async toArrow(): Promise<ArrowTable> {
+    return await this.query().toArrow();
+  }
+
+  async indexStats(name: string): Promise<IndexStatistics | undefined> {
+    const stats = await this.inner.indexStats(name);
+    if (stats === null) {
+      return undefined;
+    }
+    return stats;
+  }
+  mergeInsert(on: string | string[]): MergeInsertBuilder {
+    on = Array.isArray(on) ? on : [on];
+    return new MergeInsertBuilder(this.inner.mergeInsert(on));
+  }
+
+  /**
+   * Check if the table uses the new manifest path scheme.
+   *
+   * This function will return true if the table uses the V2 manifest
+   * path scheme.
+   */
+  async usesV2ManifestPaths(): Promise<boolean> {
+    return await this.inner.usesV2ManifestPaths();
+  }
+
+  /**
+   * Migrate the table to use the new manifest path scheme.
+   *
+   * This function will rename all V1 manifests to V2 manifest paths.
+   * These paths provide more efficient opening of datasets with many versions
+   * on object stores.
+   *
+   * This function is idempotent, and can be run multiple times without
+   * changing the state of the object store.
+   *
+   * However, it should not be run while other concurrent operations are happening.
+   * And it should also run until completion before resuming other operations.
+   */
+  async migrateManifestPathsV2(): Promise<void> {
+    await this.inner.migrateManifestPathsV2();
   }
 }

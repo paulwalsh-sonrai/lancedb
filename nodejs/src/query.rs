@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::ExecutableQuery;
 use lancedb::query::Query as LanceDbQuery;
 use lancedb::query::QueryBase;
+use lancedb::query::QueryExecutionOptions;
 use lancedb::query::Select;
 use lancedb::query::VectorQuery as LanceDbVectorQuery;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use crate::error::convert_error;
 use crate::error::NapiErrorExt;
 use crate::iterator::RecordBatchIterator;
 use crate::util::parse_distance_type;
@@ -42,13 +45,29 @@ impl Query {
     }
 
     #[napi]
+    pub fn full_text_search(&mut self, query: String, columns: Option<Vec<String>>) {
+        let query = FullTextSearchQuery::new(query).columns(columns);
+        self.inner = self.inner.clone().full_text_search(query);
+    }
+
+    #[napi]
     pub fn select(&mut self, columns: Vec<(String, String)>) {
         self.inner = self.inner.clone().select(Select::dynamic(&columns));
     }
 
     #[napi]
+    pub fn select_columns(&mut self, columns: Vec<String>) {
+        self.inner = self.inner.clone().select(Select::columns(&columns));
+    }
+
+    #[napi]
     pub fn limit(&mut self, limit: u32) {
         self.inner = self.inner.clone().limit(limit as usize);
+    }
+
+    #[napi]
+    pub fn offset(&mut self, offset: u32) {
+        self.inner = self.inner.clone().offset(offset as usize);
     }
 
     #[napi]
@@ -62,11 +81,45 @@ impl Query {
     }
 
     #[napi]
-    pub async fn execute(&self) -> napi::Result<RecordBatchIterator> {
-        let inner_stream = self.inner.execute().await.map_err(|e| {
-            napi::Error::from_reason(format!("Failed to execute query stream: {}", e))
-        })?;
+    pub fn fast_search(&mut self) {
+        self.inner = self.inner.clone().fast_search();
+    }
+
+    #[napi]
+    pub fn with_row_id(&mut self) {
+        self.inner = self.inner.clone().with_row_id();
+    }
+
+    #[napi(catch_unwind)]
+    pub async fn execute(
+        &self,
+        max_batch_length: Option<u32>,
+    ) -> napi::Result<RecordBatchIterator> {
+        let mut execution_opts = QueryExecutionOptions::default();
+        if let Some(max_batch_length) = max_batch_length {
+            execution_opts.max_batch_length = max_batch_length;
+        }
+        let inner_stream = self
+            .inner
+            .execute_with_options(execution_opts)
+            .await
+            .map_err(|e| {
+                napi::Error::from_reason(format!(
+                    "Failed to execute query stream: {}",
+                    convert_error(&e)
+                ))
+            })?;
         Ok(RecordBatchIterator::new(inner_stream))
+    }
+
+    #[napi]
+    pub async fn explain_plan(&self, verbose: bool) -> napi::Result<String> {
+        self.inner.explain_plan(verbose).await.map_err(|e| {
+            napi::Error::from_reason(format!(
+                "Failed to retrieve the query plan: {}",
+                convert_error(&e)
+            ))
+        })
     }
 }
 
@@ -115,8 +168,19 @@ impl VectorQuery {
     }
 
     #[napi]
+    pub fn full_text_search(&mut self, query: String, columns: Option<Vec<String>>) {
+        let query = FullTextSearchQuery::new(query).columns(columns);
+        self.inner = self.inner.clone().full_text_search(query);
+    }
+
+    #[napi]
     pub fn select(&mut self, columns: Vec<(String, String)>) {
         self.inner = self.inner.clone().select(Select::dynamic(&columns));
+    }
+
+    #[napi]
+    pub fn select_columns(&mut self, columns: Vec<String>) {
+        self.inner = self.inner.clone().select(Select::columns(&columns));
     }
 
     #[napi]
@@ -125,10 +189,49 @@ impl VectorQuery {
     }
 
     #[napi]
-    pub async fn execute(&self) -> napi::Result<RecordBatchIterator> {
-        let inner_stream = self.inner.execute().await.map_err(|e| {
-            napi::Error::from_reason(format!("Failed to execute query stream: {}", e))
-        })?;
+    pub fn offset(&mut self, offset: u32) {
+        self.inner = self.inner.clone().offset(offset as usize);
+    }
+
+    #[napi]
+    pub fn fast_search(&mut self) {
+        self.inner = self.inner.clone().fast_search();
+    }
+
+    #[napi]
+    pub fn with_row_id(&mut self) {
+        self.inner = self.inner.clone().with_row_id();
+    }
+
+    #[napi(catch_unwind)]
+    pub async fn execute(
+        &self,
+        max_batch_length: Option<u32>,
+    ) -> napi::Result<RecordBatchIterator> {
+        let mut execution_opts = QueryExecutionOptions::default();
+        if let Some(max_batch_length) = max_batch_length {
+            execution_opts.max_batch_length = max_batch_length;
+        }
+        let inner_stream = self
+            .inner
+            .execute_with_options(execution_opts)
+            .await
+            .map_err(|e| {
+                napi::Error::from_reason(format!(
+                    "Failed to execute query stream: {}",
+                    convert_error(&e)
+                ))
+            })?;
         Ok(RecordBatchIterator::new(inner_stream))
+    }
+
+    #[napi]
+    pub async fn explain_plan(&self, verbose: bool) -> napi::Result<String> {
+        self.inner.explain_plan(verbose).await.map_err(|e| {
+            napi::Error::from_reason(format!(
+                "Failed to retrieve the query plan: {}",
+                convert_error(&e)
+            ))
+        })
     }
 }

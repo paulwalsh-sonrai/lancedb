@@ -14,21 +14,22 @@
 
 use std::collections::HashMap;
 
+use env_logger::Env;
 use napi_derive::*;
 
 mod connection;
 mod error;
 mod index;
 mod iterator;
+pub mod merge;
 mod query;
+pub mod remote;
 mod table;
 mod util;
 
 #[napi(object)]
 #[derive(Debug)]
 pub struct ConnectionOptions {
-    pub api_key: Option<String>,
-    pub host_override: Option<String>,
     /// (For LanceDB OSS only): The interval, in seconds, at which to check for
     /// updates to the table from other processes. If None, then consistency is not
     /// checked. For performance reasons, this is the default. For strong
@@ -43,6 +44,19 @@ pub struct ConnectionOptions {
     ///
     /// The available options are described at https://lancedb.github.io/lancedb/guides/storage/
     pub storage_options: Option<HashMap<String, String>>,
+
+    /// (For LanceDB cloud only): configuration for the remote HTTP client.
+    pub client_config: Option<remote::ClientConfig>,
+    /// (For LanceDB cloud only): the API key to use with LanceDB Cloud.
+    ///
+    /// Can also be set via the environment variable `LANCEDB_API_KEY`.
+    pub api_key: Option<String>,
+    /// (For LanceDB cloud only): the region to use for LanceDB cloud.
+    /// Defaults to 'us-east-1'.
+    pub region: Option<String>,
+    /// (For LanceDB cloud only): the host to use for LanceDB cloud. Used
+    /// for testing purposes.
+    pub host_override: Option<String>,
 }
 
 /// Write mode for writing a table.
@@ -56,10 +70,19 @@ pub enum WriteMode {
 /// Write options when creating a Table.
 #[napi(object)]
 pub struct WriteOptions {
+    /// Write mode for writing to a table.
     pub mode: Option<WriteMode>,
 }
 
 #[napi(object)]
 pub struct OpenTableOptions {
     pub storage_options: Option<HashMap<String, String>>,
+}
+
+#[napi::module_init]
+fn init() {
+    let env = Env::new()
+        .filter_or("LANCEDB_LOG", "warn")
+        .write_style("LANCEDB_LOG_STYLE");
+    env_logger::init_from_env(env);
 }

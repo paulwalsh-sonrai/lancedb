@@ -12,14 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { RecordBatch, tableFromIPC, Table as ArrowTable } from "apache-arrow";
+import {
+  Table as ArrowTable,
+  type IntoVector,
+  RecordBatch,
+  tableFromIPC,
+} from "./arrow";
+import { type IvfPqOptions } from "./indices";
 import {
   RecordBatchIterator as NativeBatchIterator,
   Query as NativeQuery,
   Table as NativeTable,
   VectorQuery as NativeVectorQuery,
 } from "./native";
-import { type IvfPqOptions } from "./indices";
 export class RecordBatchIterator implements AsyncIterator<RecordBatch> {
   private promisedInner?: Promise<NativeBatchIterator>;
   private inner?: NativeBatchIterator;
@@ -29,7 +34,7 @@ export class RecordBatchIterator implements AsyncIterator<RecordBatch> {
     this.promisedInner = promise;
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // biome-ignore lint/suspicious/noExplicitAny: skip
   async next(): Promise<IteratorResult<RecordBatch<any>>> {
     if (this.inner === undefined) {
       this.inner = await this.promisedInner;
@@ -50,14 +55,73 @@ export class RecordBatchIterator implements AsyncIterator<RecordBatch> {
 }
 /* eslint-enable */
 
-/** Common methods supported by all query types */
-export class QueryBase<
+class RecordBatchIterable<
   NativeQueryType extends NativeQuery | NativeVectorQuery,
-  QueryType,
 > implements AsyncIterable<RecordBatch>
 {
-  protected constructor(protected inner: NativeQueryType) {}
+  private inner: NativeQueryType;
+  private options?: QueryExecutionOptions;
 
+  constructor(inner: NativeQueryType, options?: QueryExecutionOptions) {
+    this.inner = inner;
+    this.options = options;
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: skip
+  [Symbol.asyncIterator](): AsyncIterator<RecordBatch<any>, any, undefined> {
+    return new RecordBatchIterator(
+      this.inner.execute(this.options?.maxBatchLength),
+    );
+  }
+}
+
+/**
+ * Options that control the behavior of a particular query execution
+ */
+export interface QueryExecutionOptions {
+  /**
+   * The maximum number of rows to return in a single batch
+   *
+   * Batches may have fewer rows if the underlying data is stored
+   * in smaller chunks.
+   */
+  maxBatchLength?: number;
+}
+
+/**
+ * Options that control the behavior of a full text search
+ */
+export interface FullTextSearchOptions {
+  /**
+   * The columns to search
+   *
+   * If not specified, all indexed columns will be searched.
+   * For now, only one column can be searched.
+   */
+  columns?: string | string[];
+}
+
+/** Common methods supported by all query types */
+export class QueryBase<NativeQueryType extends NativeQuery | NativeVectorQuery>
+  implements AsyncIterable<RecordBatch>
+{
+  protected constructor(
+    protected inner: NativeQueryType | Promise<NativeQueryType>,
+  ) {
+    // intentionally empty
+  }
+
+  // call a function on the inner (either a promise or the actual object)
+  protected doCall(fn: (inner: NativeQueryType) => void) {
+    if (this.inner instanceof Promise) {
+      this.inner = this.inner.then((inner) => {
+        fn(inner);
+        return inner;
+      });
+    } else {
+      fn(this.inner);
+    }
+  }
   /**
    * A filter statement to be applied to this query.
    *
@@ -70,9 +134,36 @@ export class QueryBase<
    * Filtering performance can often be improved by creating a scalar index
    * on the filter column(s).
    */
-  where(predicate: string): QueryType {
-    this.inner.onlyIf(predicate);
-    return this as unknown as QueryType;
+  where(predicate: string): this {
+    this.doCall((inner: NativeQueryType) => inner.onlyIf(predicate));
+    return this;
+  }
+  /**
+   * A filter statement to be applied to this query.
+   * @alias where
+   * @deprecated Use `where` instead
+   */
+  filter(predicate: string): this {
+    return this.where(predicate);
+  }
+
+  fullTextSearch(
+    query: string,
+    options?: Partial<FullTextSearchOptions>,
+  ): this {
+    let columns: string[] | null = null;
+    if (options) {
+      if (typeof options.columns === "string") {
+        columns = [options.columns];
+      } else if (Array.isArray(options.columns)) {
+        columns = options.columns;
+      }
+    }
+
+    this.doCall((inner: NativeQueryType) =>
+      inner.fullTextSearch(query, columns),
+    );
+    return this;
   }
 
   /**
@@ -106,18 +197,30 @@ export class QueryBase<
    * object insertion order is easy to get wrong and `Map` is more foolproof.
    */
   select(
-    columns: string[] | Map<string, string> | Record<string, string>,
-  ): QueryType {
-    let columnTuples: [string, string][];
-    if (Array.isArray(columns)) {
-      columnTuples = columns.map((c) => [c, c]);
+    columns: string[] | Map<string, string> | Record<string, string> | string,
+  ): this {
+    const selectColumns = (columnArray: string[]) => {
+      this.doCall((inner: NativeQueryType) => {
+        inner.selectColumns(columnArray);
+      });
+    };
+    const selectMapping = (columnTuples: [string, string][]) => {
+      this.doCall((inner: NativeQueryType) => {
+        inner.select(columnTuples);
+      });
+    };
+
+    if (typeof columns === "string") {
+      selectColumns([columns]);
+    } else if (Array.isArray(columns)) {
+      selectColumns(columns);
     } else if (columns instanceof Map) {
-      columnTuples = Array.from(columns.entries());
+      selectMapping(Array.from(columns.entries()));
     } else {
-      columnTuples = Object.entries(columns);
+      selectMapping(Object.entries(columns));
     }
-    this.inner.select(columnTuples);
-    return this as unknown as QueryType;
+
+    return this;
   }
 
   /**
@@ -126,13 +229,47 @@ export class QueryBase<
    * By default, a plain search has no limit.  If this method is not
    * called then every valid row from the table will be returned.
    */
-  limit(limit: number): QueryType {
-    this.inner.limit(limit);
-    return this as unknown as QueryType;
+  limit(limit: number): this {
+    this.doCall((inner: NativeQueryType) => inner.limit(limit));
+    return this;
   }
 
-  protected nativeExecute(): Promise<NativeBatchIterator> {
-    return this.inner.execute();
+  offset(offset: number): this {
+    this.doCall((inner: NativeQueryType) => inner.offset(offset));
+    return this;
+  }
+
+  /**
+   * Skip searching un-indexed data. This can make search faster, but will miss
+   * any data that is not yet indexed.
+   *
+   * Use {@link lancedb.Table#optimize} to index all un-indexed data.
+   */
+  fastSearch(): this {
+    this.doCall((inner: NativeQueryType) => inner.fastSearch());
+    return this;
+  }
+
+  /**
+   * Whether to return the row id in the results.
+   *
+   * This column can be used to match results between different queries. For
+   * example, to match results from a full text search and a vector search in
+   * order to perform hybrid search.
+   */
+  withRowId(): this {
+    this.doCall((inner: NativeQueryType) => inner.withRowId());
+    return this;
+  }
+
+  protected nativeExecute(
+    options?: Partial<QueryExecutionOptions>,
+  ): Promise<NativeBatchIterator> {
+    if (this.inner instanceof Promise) {
+      return this.inner.then((inner) => inner.execute(options?.maxBatchLength));
+    } else {
+      return this.inner.execute(options?.maxBatchLength);
+    }
   }
 
   /**
@@ -146,30 +283,60 @@ export class QueryBase<
    * single query)
    *
    */
-  protected execute(): RecordBatchIterator {
-    return new RecordBatchIterator(this.nativeExecute());
+  protected execute(
+    options?: Partial<QueryExecutionOptions>,
+  ): RecordBatchIterator {
+    return new RecordBatchIterator(this.nativeExecute(options));
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // biome-ignore lint/suspicious/noExplicitAny: skip
   [Symbol.asyncIterator](): AsyncIterator<RecordBatch<any>> {
     const promise = this.nativeExecute();
     return new RecordBatchIterator(promise);
   }
 
   /** Collect the results as an Arrow @see {@link ArrowTable}. */
-  async toArrow(): Promise<ArrowTable> {
+  async toArrow(options?: Partial<QueryExecutionOptions>): Promise<ArrowTable> {
     const batches = [];
-    for await (const batch of this) {
+    let inner;
+    if (this.inner instanceof Promise) {
+      inner = await this.inner;
+    } else {
+      inner = this.inner;
+    }
+    for await (const batch of new RecordBatchIterable(inner, options)) {
       batches.push(batch);
     }
     return new ArrowTable(batches);
   }
 
   /** Collect the results as an array of objects. */
-  async toArray(): Promise<unknown[]> {
-    const tbl = await this.toArrow();
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return
+  // biome-ignore lint/suspicious/noExplicitAny: arrow.toArrow() returns any[]
+  async toArray(options?: Partial<QueryExecutionOptions>): Promise<any[]> {
+    const tbl = await this.toArrow(options);
     return tbl.toArray();
+  }
+
+  /**
+   * Generates an explanation of the query execution plan.
+   *
+   * @example
+   * import * as lancedb from "@lancedb/lancedb"
+   * const db = await lancedb.connect("./.lancedb");
+   * const table = await db.createTable("my_table", [
+   *   { vector: [1.1, 0.9], id: "1" },
+   * ]);
+   * const plan = await table.query().nearestTo([0.5, 0.2]).explainPlan();
+   *
+   * @param verbose - If true, provides a more detailed explanation. Defaults to false.
+   * @returns A Promise that resolves to a string containing the query execution plan explanation.
+   */
+  async explainPlan(verbose = false): Promise<string> {
+    if (this.inner instanceof Promise) {
+      return this.inner.then((inner) => inner.explainPlan(verbose));
+    } else {
+      return this.inner.explainPlan(verbose);
+    }
   }
 }
 
@@ -185,8 +352,8 @@ export interface ExecutableQuery {}
  *
  * This builder can be reused to execute the query many times.
  */
-export class VectorQuery extends QueryBase<NativeVectorQuery, VectorQuery> {
-  constructor(inner: NativeVectorQuery) {
+export class VectorQuery extends QueryBase<NativeVectorQuery> {
+  constructor(inner: NativeVectorQuery | Promise<NativeVectorQuery>) {
     super(inner);
   }
 
@@ -213,7 +380,8 @@ export class VectorQuery extends QueryBase<NativeVectorQuery, VectorQuery> {
    * you the desired recall.
    */
   nprobes(nprobes: number): VectorQuery {
-    this.inner.nprobes(nprobes);
+    super.doCall((inner) => inner.nprobes(nprobes));
+
     return this;
   }
 
@@ -227,7 +395,7 @@ export class VectorQuery extends QueryBase<NativeVectorQuery, VectorQuery> {
    * whose data type is a fixed-size-list of floats.
    */
   column(column: string): VectorQuery {
-    this.inner.column(column);
+    super.doCall((inner) => inner.column(column));
     return this;
   }
 
@@ -245,8 +413,10 @@ export class VectorQuery extends QueryBase<NativeVectorQuery, VectorQuery> {
    *
    * By default "l2" is used.
    */
-  distanceType(distanceType: string): VectorQuery {
-    this.inner.distanceType(distanceType);
+  distanceType(
+    distanceType: Required<IvfPqOptions>["distanceType"],
+  ): VectorQuery {
+    super.doCall((inner) => inner.distanceType(distanceType));
     return this;
   }
 
@@ -280,7 +450,7 @@ export class VectorQuery extends QueryBase<NativeVectorQuery, VectorQuery> {
    * distance between the query vector and the actual uncompressed vector.
    */
   refineFactor(refineFactor: number): VectorQuery {
-    this.inner.refineFactor(refineFactor);
+    super.doCall((inner) => inner.refineFactor(refineFactor));
     return this;
   }
 
@@ -305,7 +475,7 @@ export class VectorQuery extends QueryBase<NativeVectorQuery, VectorQuery> {
    * factor can often help restore some of the results lost by post filtering.
    */
   postfilter(): VectorQuery {
-    this.inner.postfilter();
+    super.doCall((inner) => inner.postfilter());
     return this;
   }
 
@@ -319,13 +489,13 @@ export class VectorQuery extends QueryBase<NativeVectorQuery, VectorQuery> {
    * calculate your recall to select an appropriate value for nprobes.
    */
   bypassVectorIndex(): VectorQuery {
-    this.inner.bypassVectorIndex();
+    super.doCall((inner) => inner.bypassVectorIndex());
     return this;
   }
 }
 
 /** A builder for LanceDB queries. */
-export class Query extends QueryBase<NativeQuery, Query> {
+export class Query extends QueryBase<NativeQuery> {
   constructor(tbl: NativeTable) {
     super(tbl.query());
   }
@@ -367,9 +537,38 @@ export class Query extends QueryBase<NativeQuery, Query> {
    * Vector searches always have a `limit`.  If `limit` has not been called then
    * a default `limit` of 10 will be used.  @see {@link Query#limit}
    */
-  nearestTo(vector: unknown): VectorQuery {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const vectorQuery = this.inner.nearestTo(Float32Array.from(vector as any));
-    return new VectorQuery(vectorQuery);
+  nearestTo(vector: IntoVector): VectorQuery {
+    if (this.inner instanceof Promise) {
+      const nativeQuery = this.inner.then(async (inner) => {
+        if (vector instanceof Promise) {
+          const arr = await vector.then((v) => Float32Array.from(v));
+          return inner.nearestTo(arr);
+        } else {
+          return inner.nearestTo(Float32Array.from(vector));
+        }
+      });
+      return new VectorQuery(nativeQuery);
+    }
+    if (vector instanceof Promise) {
+      const res = (async () => {
+        try {
+          const v = await vector;
+          const arr = Float32Array.from(v);
+          //
+          // biome-ignore lint/suspicious/noExplicitAny: we need to get the `inner`, but js has no package scoping
+          const value: any = this.nearestTo(arr);
+          const inner = value.inner as
+            | NativeVectorQuery
+            | Promise<NativeVectorQuery>;
+          return inner;
+        } catch (e) {
+          return Promise.reject(e);
+        }
+      })();
+      return new VectorQuery(res);
+    } else {
+      const vectorQuery = this.inner.nearestTo(Float32Array.from(vector));
+      return new VectorQuery(vectorQuery);
+    }
   }
 }

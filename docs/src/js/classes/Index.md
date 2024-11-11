@@ -1,57 +1,16 @@
-[@lancedb/lancedb](../README.md) / [Exports](../modules.md) / Index
+[**@lancedb/lancedb**](../README.md) • **Docs**
+
+***
+
+[@lancedb/lancedb](../globals.md) / Index
 
 # Class: Index
 
-## Table of contents
-
-### Constructors
-
-- [constructor](Index.md#constructor)
-
-### Properties
-
-- [inner](Index.md#inner)
-
-### Methods
-
-- [btree](Index.md#btree)
-- [ivfPq](Index.md#ivfpq)
-
-## Constructors
-
-### constructor
-
-• **new Index**(`inner`): [`Index`](Index.md)
-
-#### Parameters
-
-| Name | Type |
-| :------ | :------ |
-| `inner` | `Index` |
-
-#### Returns
-
-[`Index`](Index.md)
-
-#### Defined in
-
-[indices.ts:118](https://github.com/lancedb/lancedb/blob/9d178c7/nodejs/lancedb/indices.ts#L118)
-
-## Properties
-
-### inner
-
-• `Private` `Readonly` **inner**: `Index`
-
-#### Defined in
-
-[indices.ts:117](https://github.com/lancedb/lancedb/blob/9d178c7/nodejs/lancedb/indices.ts#L117)
-
 ## Methods
 
-### btree
+### btree()
 
-▸ **btree**(): [`Index`](Index.md)
+> `static` **btree**(): [`Index`](Index.md)
 
 Create a btree index
 
@@ -75,15 +34,11 @@ block size may be added in the future.
 
 [`Index`](Index.md)
 
-#### Defined in
+***
 
-[indices.ts:175](https://github.com/lancedb/lancedb/blob/9d178c7/nodejs/lancedb/indices.ts#L175)
+### ivfPq()
 
-___
-
-### ivfPq
-
-▸ **ivfPq**(`options?`): [`Index`](Index.md)
+> `static` **ivfPq**(`options`?): [`Index`](Index.md)
 
 Create an IvfPq index
 
@@ -108,14 +63,30 @@ currently is also a memory intensive operation.
 
 #### Parameters
 
-| Name | Type |
-| :------ | :------ |
-| `options?` | `Partial`\<[`IvfPqOptions`](../interfaces/IvfPqOptions.md)\> |
+• **options?**: `Partial`&lt;[`IvfPqOptions`](../interfaces/IvfPqOptions.md)&gt;
 
 #### Returns
 
 [`Index`](Index.md)
 
-#### Defined in
+### fts()
 
-[indices.ts:144](https://github.com/lancedb/lancedb/blob/9d178c7/nodejs/lancedb/indices.ts#L144)
+> `static` **fts**(`options`?): [`Index`](Index.md)
+
+Create a full text search index
+
+This index is used to search for text data.  The index is created by tokenizing the text
+into words and then storing occurrences of these words in a data structure called inverted index
+that allows for fast search.
+
+During a search the query is tokenized and the inverted index is used to find the rows that
+contain the query words.  The rows are then scored based on BM25 and the top scoring rows are
+sorted and returned.
+
+#### Parameters
+
+• **options?**: `Partial`&lt;[`FtsOptions`](../interfaces/FtsOptions.md)&gt;
+
+#### Returns
+
+[`Index`](Index.md)

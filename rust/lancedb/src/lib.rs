@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! [LanceDB](https://github.com/lancedb/lancedb) is an open-source database for vector-search built with persistent storage,
-//! which greatly simplifies retrevial, filtering and management of embeddings.
+//! which greatly simplifies retrieval, filtering and management of embeddings.
 //!
 //! The key features of LanceDB include:
 //! - Production-scale vector search with no servers to manage.
@@ -133,6 +133,13 @@
 //!
 //! #### Create vector index (IVF_PQ)
 //!
+//! LanceDB is capable to automatically create appropriate indices based on the data types
+//! of the columns. For example,
+//!
+//! * If a column has a data type of `FixedSizeList<Float16/Float32>`,
+//!   LanceDB will create a `IVF-PQ` vector index with default parameters.
+//! * Otherwise, it creates a `BTree` index by default.
+//!
 //! ```no_run
 //! # use std::sync::Arc;
 //! # use arrow_array::{FixedSizeListArray, types::Float32Type, RecordBatch,
@@ -150,7 +157,10 @@
 //! # });
 //! ```
 //!
-//! #### Open table and run search
+//!
+//! User can also specify the index type explicitly, see [`Table::create_index`].
+//!
+//! #### Open table and search
 //!
 //! ```rust
 //! # use std::sync::Arc;
@@ -194,6 +204,7 @@
 pub mod arrow;
 pub mod connection;
 pub mod data;
+pub mod embeddings;
 pub mod error;
 pub mod index;
 pub mod io;
@@ -202,7 +213,7 @@ pub mod ipc;
 mod polars_arrow_convertors;
 pub mod query;
 #[cfg(feature = "remote")]
-pub(crate) mod remote;
+pub mod remote;
 pub mod table;
 pub mod utils;
 
@@ -217,6 +228,7 @@ pub use table::Table;
 
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
+#[serde(rename_all = "lowercase")]
 pub enum DistanceType {
     /// Euclidean distance. This is a very common distance metric that
     /// accounts for both magnitude and direction when determining the distance
@@ -237,6 +249,15 @@ pub enum DistanceType {
     /// distance has a range of (-∞, ∞). If the vectors are normalized (i.e. their
     /// L2 norm is 1), then dot distance is equivalent to the cosine distance.
     Dot,
+    /// Hamming distance. Hamming distance is a distance metric that measures
+    /// the number of positions at which the corresponding elements are different.
+    Hamming,
+}
+
+impl Default for DistanceType {
+    fn default() -> Self {
+        Self::L2
+    }
 }
 
 impl From<DistanceType> for LanceDistanceType {
@@ -245,6 +266,7 @@ impl From<DistanceType> for LanceDistanceType {
             DistanceType::L2 => Self::L2,
             DistanceType::Cosine => Self::Cosine,
             DistanceType::Dot => Self::Dot,
+            DistanceType::Hamming => Self::Hamming,
         }
     }
 }
@@ -255,6 +277,7 @@ impl From<LanceDistanceType> for DistanceType {
             LanceDistanceType::L2 => Self::L2,
             LanceDistanceType::Cosine => Self::Cosine,
             LanceDistanceType::Dot => Self::Dot,
+            LanceDistanceType::Hamming => Self::Hamming,
         }
     }
 }

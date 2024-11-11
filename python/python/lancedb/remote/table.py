@@ -11,52 +11,72 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from datetime import timedelta
+import asyncio
 import logging
-import uuid
-from concurrent.futures import Future
 from functools import cached_property
-from typing import Dict, Iterable, Optional, Union
+from typing import Dict, Iterable, List, Optional, Union, Literal
 
+from lancedb.index import FTS, BTree, Bitmap, HnswPq, HnswSq, IvfPq, LabelList
 import pyarrow as pa
-from lance import json_to_schema
 
 from lancedb.common import DATA, VEC, VECTOR_COLUMN_NAME
 from lancedb.merge import LanceMergeInsertBuilder
+from lancedb.embeddings import EmbeddingFunctionRegistry
 
-from ..query import LanceVectorQueryBuilder
-from ..table import Query, Table, _sanitize_data
-from ..util import inf_vector_column_query, value_to_sql
-from .arrow import to_ipc_binary
-from .client import ARROW_STREAM_CONTENT_TYPE
-from .db import RemoteDBConnection
+from ..query import LanceVectorQueryBuilder, LanceQueryBuilder
+from ..table import AsyncTable, Query, Table
 
 
 class RemoteTable(Table):
-    def __init__(self, conn: RemoteDBConnection, name: str):
-        self._conn = conn
-        self._name = name
+    def __init__(
+        self,
+        table: AsyncTable,
+        db_name: str,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ):
+        self._loop = loop
+        self._table = table
+        self.db_name = db_name
+
+    @property
+    def name(self) -> str:
+        """The name of the table"""
+        return self._table.name
 
     def __repr__(self) -> str:
-        return f"RemoteTable({self._conn.db_name}.{self._name})"
+        return f"RemoteTable({self.db_name}.{self.name})"
 
     def __len__(self) -> int:
         self.count_rows(None)
 
-    @cached_property
+    @property
     def schema(self) -> pa.Schema:
         """The [Arrow Schema](https://arrow.apache.org/docs/python/api/datatypes.html#)
         of this Table
 
         """
-        resp = self._conn._client.post(f"/v1/table/{self._name}/describe/")
-        schema = json_to_schema(resp["schema"])
-        return schema
+        return self._loop.run_until_complete(self._table.schema())
 
     @property
     def version(self) -> int:
         """Get the current version of the table"""
-        resp = self._conn._client.post(f"/v1/table/{self._name}/describe/")
-        return resp["version"]
+        return self._loop.run_until_complete(self._table.version())
+
+    @cached_property
+    def embedding_functions(self) -> dict:
+        """
+        Get the embedding functions for the table
+
+        Returns
+        -------
+        funcs: dict
+            A mapping of the vector column to the embedding function
+            or empty dict if not configured.
+        """
+        return EmbeddingFunctionRegistry.get_instance().parse_functions(
+            self.schema.metadata
+        )
 
     def to_arrow(self) -> pa.Table:
         """to_arrow() is not yet supported on LanceDB cloud."""
@@ -68,19 +88,18 @@ class RemoteTable(Table):
 
     def list_indices(self):
         """List all the indices on the table"""
-        resp = self._conn._client.post(f"/v1/table/{self._name}/index/list/")
-        return resp
+        return self._loop.run_until_complete(self._table.list_indices())
 
     def index_stats(self, index_uuid: str):
         """List all the stats of a specified index"""
-        resp = self._conn._client.post(
-            f"/v1/table/{self._name}/index/{index_uuid}/stats/"
-        )
-        return resp
+        return self._loop.run_until_complete(self._table.index_stats(index_uuid))
 
     def create_scalar_index(
         self,
         column: str,
+        index_type: Literal["BTREE", "BITMAP", "LABEL_LIST", "scalar"] = "scalar",
+        *,
+        replace: bool = False,
     ):
         """Creates a scalar index
         Parameters
@@ -88,19 +107,36 @@ class RemoteTable(Table):
         column : str
             The column to be indexed.  Must be a boolean, integer, float,
             or string column.
+        index_type : str
+            The index type of the scalar index. Must be "scalar" (BTREE),
+            "BTREE", "BITMAP", or "LABEL_LIST",
+        replace : bool
+            If True, replace the existing index with the new one.
         """
-        index_type = "scalar"
+        if index_type == "scalar" or index_type == "BTREE":
+            config = BTree()
+        elif index_type == "BITMAP":
+            config = Bitmap()
+        elif index_type == "LABEL_LIST":
+            config = LabelList()
+        else:
+            raise ValueError(f"Unknown index type: {index_type}")
 
-        data = {
-            "column": column,
-            "index_type": index_type,
-            "replace": True,
-        }
-        resp = self._conn._client.post(
-            f"/v1/table/{self._name}/create_scalar_index/", data=data
+        self._loop.run_until_complete(
+            self._table.create_index(column, config=config, replace=replace)
         )
 
-        return resp
+    def create_fts_index(
+        self,
+        column: str,
+        *,
+        replace: bool = False,
+        with_position: bool = True,
+    ):
+        config = FTS(with_position=with_position)
+        self._loop.run_until_complete(
+            self._table.create_index(column, config=config, replace=replace)
+        )
 
     def create_index(
         self,
@@ -111,6 +147,7 @@ class RemoteTable(Table):
         num_sub_vectors: Optional[int] = None,
         replace: Optional[bool] = None,
         accelerator: Optional[str] = None,
+        index_type="vector",
     ):
         """Create an index on the table.
         Currently, the only parameters that matter are
@@ -166,19 +203,23 @@ class RemoteTable(Table):
                 "replace is not supported on LanceDB cloud."
                 "Existing indexes will always be replaced."
             )
-        index_type = "vector"
 
-        data = {
-            "column": vector_column_name,
-            "index_type": index_type,
-            "metric_type": metric,
-            "index_cache_size": index_cache_size,
-        }
-        resp = self._conn._client.post(
-            f"/v1/table/{self._name}/create_index/", data=data
+        index_type = index_type.upper()
+        if index_type == "VECTOR" or index_type == "IVF_PQ":
+            config = IvfPq(distance_type=metric)
+        elif index_type == "IVF_HNSW_PQ":
+            config = HnswPq(distance_type=metric)
+        elif index_type == "IVF_HNSW_SQ":
+            config = HnswSq(distance_type=metric)
+        else:
+            raise ValueError(
+                f"Unknown vector index type: {index_type}. Valid options are"
+                " 'IVF_PQ', 'IVF_HNSW_PQ', 'IVF_HNSW_SQ'"
+            )
+
+        self._loop.run_until_complete(
+            self._table.create_index(vector_column_name, config=config)
         )
-
-        return resp
 
     def add(
         self,
@@ -210,28 +251,19 @@ class RemoteTable(Table):
             The value to use when filling vectors. Only used if on_bad_vectors="fill".
 
         """
-        data = _sanitize_data(
-            data,
-            self.schema,
-            metadata=None,
-            on_bad_vectors=on_bad_vectors,
-            fill_value=fill_value,
-        )
-        payload = to_ipc_binary(data)
-
-        request_id = uuid.uuid4().hex
-
-        self._conn._client.post(
-            f"/v1/table/{self._name}/insert/",
-            data=payload,
-            params={"request_id": request_id, "mode": mode},
-            content_type=ARROW_STREAM_CONTENT_TYPE,
+        self._loop.run_until_complete(
+            self._table.add(
+                data, mode=mode, on_bad_vectors=on_bad_vectors, fill_value=fill_value
+            )
         )
 
     def search(
         self,
-        query: Union[VEC, str],
+        query: Union[VEC, str] = None,
         vector_column_name: Optional[str] = None,
+        query_type="auto",
+        fts_columns: Optional[Union[str, List[str]]] = None,
+        fast_search: bool = False,
     ) -> LanceVectorQueryBuilder:
         """Create a search query to find the nearest neighbors
         of the given query vector. We currently support [vector search][search]
@@ -267,8 +299,6 @@ class RemoteTable(Table):
             - *default None*.
             Acceptable types are: list, np.ndarray, PIL.Image.Image
 
-            - If None then the select/where/limit clauses are applied to filter
-            the table
         vector_column_name: str, optional
             The name of the vector column to search.
 
@@ -277,6 +307,12 @@ class RemoteTable(Table):
 
             - If the table has multiple vector columns then the *vector_column_name*
             needs to be specified. Otherwise, an error is raised.
+
+        fast_search: bool, optional
+            Skip a flat search of unindexed data. This may improve
+            search performance but search results will not include unindexed data.
+
+            - *default False*.
 
         Returns
         -------
@@ -291,44 +327,33 @@ class RemoteTable(Table):
             - and also the "_distance" column which is the distance between the query
             vector and the returned vector.
         """
-        if vector_column_name is None:
-            vector_column_name = inf_vector_column_query(self.schema)
-        return LanceVectorQueryBuilder(self, query, vector_column_name)
+        # empty query builder is not supported in saas, raise error
+        if query is None and query_type != "hybrid":
+            raise ValueError("Empty query is not supported")
+
+        return LanceQueryBuilder.create(
+            self,
+            query,
+            query_type,
+            vector_column_name=vector_column_name,
+            fts_columns=fts_columns,
+            fast_search=fast_search,
+        )
 
     def _execute_query(
         self, query: Query, batch_size: Optional[int] = None
     ) -> pa.RecordBatchReader:
-        if (
-            query.vector is not None
-            and len(query.vector) > 0
-            and not isinstance(query.vector[0], float)
-        ):
-            if self._conn._request_thread_pool is None:
+        return self._loop.run_until_complete(
+            self._table._execute_query(query, batch_size=batch_size)
+        )
 
-                def submit(name, q):
-                    f = Future()
-                    f.set_result(self._conn._client.query(name, q))
-                    return f
+    def merge_insert(self, on: Union[str, Iterable[str]]) -> LanceMergeInsertBuilder:
+        """Returns a [`LanceMergeInsertBuilder`][lancedb.merge.LanceMergeInsertBuilder]
+        that can be used to create a "merge insert" operation.
 
-            else:
-
-                def submit(name, q):
-                    return self._conn._request_thread_pool.submit(
-                        self._conn._client.query, name, q
-                    )
-
-            results = []
-            for v in query.vector:
-                v = list(v)
-                q = query.copy()
-                q.vector = v
-                results.append(submit(self._name, q))
-            return pa.concat_tables(
-                [add_index(r.result().to_arrow(), i) for i, r in enumerate(results)]
-            ).to_reader()
-        else:
-            result = self._conn._client.query(self._name, query)
-            return result.to_arrow().to_reader()
+        See [`Table.merge_insert`][lancedb.table.Table.merge_insert] for more details.
+        """
+        return super().merge_insert(on)
 
     def _do_merge(
         self,
@@ -337,42 +362,8 @@ class RemoteTable(Table):
         on_bad_vectors: str,
         fill_value: float,
     ):
-        data = _sanitize_data(
-            new_data,
-            self.schema,
-            metadata=None,
-            on_bad_vectors=on_bad_vectors,
-            fill_value=fill_value,
-        )
-        payload = to_ipc_binary(data)
-
-        params = {}
-        if len(merge._on) != 1:
-            raise ValueError(
-                "RemoteTable only supports a single on key in merge_insert"
-            )
-        params["on"] = merge._on[0]
-        params["when_matched_update_all"] = str(merge._when_matched_update_all).lower()
-        if merge._when_matched_update_all_condition is not None:
-            params[
-                "when_matched_update_all_filt"
-            ] = merge._when_matched_update_all_condition
-        params["when_not_matched_insert_all"] = str(
-            merge._when_not_matched_insert_all
-        ).lower()
-        params["when_not_matched_by_source_delete"] = str(
-            merge._when_not_matched_by_source_delete
-        ).lower()
-        if merge._when_not_matched_by_source_condition is not None:
-            params[
-                "when_not_matched_by_source_delete_filt"
-            ] = merge._when_not_matched_by_source_condition
-
-        self._conn._client.post(
-            f"/v1/table/{self._name}/merge_insert/",
-            data=payload,
-            params=params,
-            content_type=ARROW_STREAM_CONTENT_TYPE,
+        self._loop.run_until_complete(
+            self._table._do_merge(merge, new_data, on_bad_vectors, fill_value)
         )
 
     def delete(self, predicate: str):
@@ -422,8 +413,7 @@ class RemoteTable(Table):
            x      vector  _distance # doctest: +SKIP
         0  2  [3.0, 4.0]       85.0 # doctest: +SKIP
         """
-        payload = {"predicate": predicate}
-        self._conn._client.post(f"/v1/table/{self._name}/delete/", data=payload)
+        self._loop.run_until_complete(self._table.delete(predicate))
 
     def update(
         self,
@@ -473,18 +463,9 @@ class RemoteTable(Table):
         2  2  [10.0, 10.0] # doctest: +SKIP
 
         """
-        if values is not None and values_sql is not None:
-            raise ValueError("Only one of values or values_sql can be provided")
-        if values is None and values_sql is None:
-            raise ValueError("Either values or values_sql must be provided")
-
-        if values is not None:
-            updates = [[k, value_to_sql(v)] for k, v in values.items()]
-        else:
-            updates = [[k, v] for k, v in values_sql.items()]
-
-        payload = {"predicate": where, "updates": updates}
-        self._conn._client.post(f"/v1/table/{self._name}/update/", data=payload)
+        self._loop.run_until_complete(
+            self._table.update(where=where, updates=values, updates_sql=values_sql)
+        )
 
     def cleanup_old_versions(self, *_):
         """cleanup_old_versions() is not supported on the LanceDB cloud"""
@@ -498,12 +479,21 @@ class RemoteTable(Table):
             "compact_files() is not supported on the LanceDB cloud"
         )
 
-    def count_rows(self, filter: Optional[str] = None) -> int:
-        payload = {"predicate": filter}
-        resp = self._conn._client.post(
-            f"/v1/table/{self._name}/count_rows/", data=payload
+    def optimize(
+        self,
+        *,
+        cleanup_older_than: Optional[timedelta] = None,
+        delete_unverified: bool = False,
+    ):
+        """optimize() is not supported on the LanceDB cloud.
+        Indices are optimized automatically."""
+        raise NotImplementedError(
+            "optimize() is not supported on the LanceDB cloud. "
+            "Indices are optimized automatically."
         )
-        return resp
+
+    def count_rows(self, filter: Optional[str] = None) -> int:
+        return self._loop.run_until_complete(self._table.count_rows(filter))
 
     def add_columns(self, transforms: Dict[str, str]):
         raise NotImplementedError(

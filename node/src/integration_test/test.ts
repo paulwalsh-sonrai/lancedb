@@ -14,6 +14,7 @@
 
 import { describe } from 'mocha'
 import * as chai from 'chai'
+import { assert } from 'chai'
 import * as chaiAsPromised from 'chai-as-promised'
 import { v4 as uuidv4 } from 'uuid'
 
@@ -22,7 +23,6 @@ import { tmpdir } from 'os'
 import * as fs from 'fs'
 import * as path from 'path'
 
-const assert = chai.assert
 chai.use(chaiAsPromised)
 
 describe('LanceDB AWS Integration test', function () {
@@ -51,7 +51,7 @@ describe('LanceDB Mirrored Store Integration test', function () {
 
     const dir = tmpdir()
     console.log(dir)
-    const conn = await lancedb.connect(`s3://lancedb-integtest?mirroredStore=${dir}`)
+    const conn = await lancedb.connect({ uri: `s3://lancedb-integtest?mirroredStore=${dir}`, storageOptions: { allowHttp: 'true' } })
     const data = Array(200).fill({ vector: Array(128).fill(1.0), id: 0 })
     data.push(...Array(200).fill({ vector: Array(128).fill(1.0), id: 1 }))
     data.push(...Array(200).fill({ vector: Array(128).fill(1.0), id: 2 }))

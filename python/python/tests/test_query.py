@@ -17,6 +17,7 @@ from typing import Optional
 
 import lance
 import lancedb
+from lancedb.index import IvfPq
 import numpy as np
 import pandas.testing as tm
 import pyarrow as pa
@@ -51,6 +52,7 @@ class MockTable:
                 "refine_factor": query.refine_factor,
             },
             batch_size=batch_size,
+            offset=query.offset,
         ).to_reader()
 
 
@@ -106,6 +108,13 @@ def test_cast(table):
     assert r0.float_field == 1.0
 
 
+def test_offset(table):
+    results_without_offset = LanceVectorQueryBuilder(table, [0, 0], "vector")
+    assert len(results_without_offset.to_pandas()) == 2
+    results_with_offset = LanceVectorQueryBuilder(table, [0, 0], "vector").offset(1)
+    assert len(results_with_offset.to_pandas()) == 1
+
+
 def test_query_builder(table):
     rs = (
         LanceVectorQueryBuilder(table, [0, 0], "vector")
@@ -115,6 +124,18 @@ def test_query_builder(table):
     )
     assert rs[0]["id"] == 1
     assert all(np.array(rs[0]["vector"]) == [1, 2])
+
+
+def test_vector_query_with_no_limit(table):
+    with pytest.raises(ValueError):
+        LanceVectorQueryBuilder(table, [0, 0], "vector").limit(0).select(
+            ["id", "vector"]
+        ).to_list()
+
+    with pytest.raises(ValueError):
+        LanceVectorQueryBuilder(table, [0, 0], "vector").limit(None).select(
+            ["id", "vector"]
+        ).to_list()
 
 
 def test_query_builder_batches(table):
@@ -257,7 +278,10 @@ async def test_query_async(table_async: AsyncTable):
         table_async.query().select({"foo": "id", "bar": "id + 1"}),
         expected_columns=["foo", "bar"],
     )
+
     await check_query(table_async.query().limit(1), expected_num_rows=1)
+    await check_query(table_async.query().offset(1), expected_num_rows=1)
+
     await check_query(
         table_async.query().nearest_to(pa.array([1, 2])), expected_num_rows=2
     )
@@ -307,6 +331,12 @@ async def test_query_async(table_async: AsyncTable):
     # Also check an empty query
     await check_query(table_async.query().where("id < 0"), expected_num_rows=0)
 
+    # with row id
+    await check_query(
+        table_async.query().select(["id", "vector"]).with_row_id(),
+        expected_columns=["id", "vector", "_rowid"],
+    )
+
 
 @pytest.mark.asyncio
 async def test_query_to_arrow_async(table_async: AsyncTable):
@@ -333,3 +363,51 @@ async def test_query_to_pandas_async(table_async: AsyncTable):
 
     df = await table_async.query().where("id < 0").to_pandas()
     assert df.shape == (0, 4)
+
+
+@pytest.mark.asyncio
+async def test_fast_search_async(tmp_path):
+    db = await lancedb.connect_async(tmp_path)
+    vectors = pa.FixedShapeTensorArray.from_numpy_ndarray(
+        np.random.rand(256, 32)
+    ).storage
+    table = await db.create_table("test", pa.table({"vector": vectors}))
+    await table.create_index(
+        "vector", config=IvfPq(num_partitions=1, num_sub_vectors=1)
+    )
+    await table.add(pa.table({"vector": vectors}))
+
+    q = [1.0] * 32
+    plan = await table.query().nearest_to(q).explain_plan(True)
+    assert "LanceScan" in plan
+    plan = await table.query().nearest_to(q).fast_search().explain_plan(True)
+    assert "LanceScan" not in plan
+
+
+def test_explain_plan(table):
+    q = LanceVectorQueryBuilder(table, [0, 0], "vector")
+    plan = q.explain_plan(verbose=True)
+    assert "KNN" in plan
+
+
+@pytest.mark.asyncio
+async def test_explain_plan_async(table_async: AsyncTable):
+    plan = await table_async.query().nearest_to(pa.array([1, 2])).explain_plan(True)
+    assert "KNN" in plan
+
+
+@pytest.mark.asyncio
+async def test_query_camelcase_async(tmp_path):
+    db = await lancedb.connect_async(tmp_path)
+    table = await db.create_table("test", pa.table({"camelCase": pa.array([1, 2])}))
+
+    result = await table.query().select(["camelCase"]).to_arrow()
+    assert result == pa.table({"camelCase": pa.array([1, 2])})
+
+
+@pytest.mark.asyncio
+async def test_query_to_list_async(table_async: AsyncTable):
+    list = await table_async.query().to_list()
+    assert len(list) == 2
+    assert list[0]["vector"] == [1, 2]
+    assert list[1]["vector"] == [3, 4]

@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import axios, { type AxiosResponse, type ResponseType } from 'axios'
+import axios, { type AxiosError, type AxiosResponse, type ResponseType } from 'axios'
 
 import { tableFromIPC, type Table as ArrowTable } from 'apache-arrow'
 
 import { type RemoteResponse, type RemoteRequest, Method } from '../middleware'
+import type { MetricType } from '..'
 
 interface HttpLancedbClientMiddleware {
   onRemoteRequest(
@@ -41,7 +42,7 @@ async function callWithMiddlewares (
     if (i > middlewares.length) {
       const headers = Object.fromEntries(req.headers.entries())
       const params = Object.fromEntries(req.params?.entries() ?? [])
-      const timeout = 10000
+      const timeout = opts?.timeout
       let res
       if (req.method === Method.POST) {
         res = await axios.post(
@@ -82,6 +83,7 @@ async function callWithMiddlewares (
 
 interface MiddlewareInvocationOptions {
   responseType?: ResponseType
+  timeout?: number
 }
 
 /**
@@ -123,15 +125,19 @@ export class HttpLancedbClient {
   private readonly _url: string
   private readonly _apiKey: () => string
   private readonly _middlewares: HttpLancedbClientMiddleware[]
+  private readonly _timeout: number | undefined
 
   public constructor (
     url: string,
     apiKey: string,
+    timeout?: number,
     private readonly _dbName?: string
+
   ) {
     this._url = url
     this._apiKey = () => apiKey
     this._middlewares = []
+    this._timeout = timeout
   }
 
   get uri (): string {
@@ -146,7 +152,9 @@ export class HttpLancedbClient {
     prefilter: boolean,
     refineFactor?: number,
     columns?: string[],
-    filter?: string
+    filter?: string,
+    metricType?: MetricType,
+    fastSearch?: boolean
   ): Promise<ArrowTable<any>> {
     const result = await this.post(
       `/v1/table/${tableName}/query/`,
@@ -154,10 +162,12 @@ export class HttpLancedbClient {
         vector,
         k,
         nprobes,
-        refineFactor,
+        refine_factor: refineFactor,
         columns,
         filter,
-        prefilter
+        prefilter,
+        metric: metricType,
+        fast_search: fastSearch
       },
       undefined,
       undefined,
@@ -187,7 +197,7 @@ export class HttpLancedbClient {
       response = await callWithMiddlewares(req, this._middlewares)
       return response
     } catch (err: any) {
-      console.error('error: ', err)
+      console.error(serializeErrorAsJson(err))
       if (err.response === undefined) {
         throw new Error(`Network Error: ${err.message as string}`)
       }
@@ -230,11 +240,15 @@ export class HttpLancedbClient {
 
     let response
     try {
-      response = await callWithMiddlewares(req, this._middlewares, { responseType })
+      response = await callWithMiddlewares(req, this._middlewares, {
+        responseType,
+        timeout: this._timeout
+      })
 
       // return response
     } catch (err: any) {
-      console.error('error: ', err)
+      console.error(serializeErrorAsJson(err))
+
       if (err.response === undefined) {
         throw new Error(`Network Error: ${err.message as string}`)
       }
@@ -267,10 +281,22 @@ export class HttpLancedbClient {
    * Make a clone of this client
    */
   private clone (): HttpLancedbClient {
-    const clone = new HttpLancedbClient(this._url, this._apiKey(), this._dbName)
+    const clone = new HttpLancedbClient(this._url, this._apiKey(), this._timeout, this._dbName)
     for (const mw of this._middlewares) {
       clone._middlewares.push(mw)
     }
     return clone
   }
+}
+
+function serializeErrorAsJson(err: AxiosError) {
+  const error = JSON.parse(JSON.stringify(err, Object.getOwnPropertyNames(err)))
+  error.response = err.response != null
+      ? JSON.parse(JSON.stringify(
+        err.response,
+        // config contains the request data, too noisy
+        Object.getOwnPropertyNames(err.response).filter(prop => prop !== 'config')
+      ))
+      : null
+  return JSON.stringify({ error })
 }

@@ -15,14 +15,14 @@ import importlib.metadata
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, Any
 
 __version__ = importlib.metadata.version("lancedb")
 
 from ._lancedb import connect as lancedb_connect
 from .common import URI, sanitize_uri
 from .db import AsyncConnection, DBConnection, LanceDBConnection
-from .remote.db import RemoteDBConnection
+from .remote import ClientConfig
 from .schema import vector
 from .table import AsyncTable
 
@@ -35,7 +35,8 @@ def connect(
     host_override: Optional[str] = None,
     read_consistency_interval: Optional[timedelta] = None,
     request_thread_pool: Optional[Union[int, ThreadPoolExecutor]] = None,
-    **kwargs,
+    client_config: Union[ClientConfig, Dict[str, Any], None] = None,
+    **kwargs: Any,
 ) -> DBConnection:
     """Connect to a LanceDB database.
 
@@ -62,14 +63,10 @@ def connect(
         the last check, then the table will be checked for updates. Note: this
         consistency only applies to read operations. Write operations are
         always consistent.
-    request_thread_pool: int or ThreadPoolExecutor, optional
-        The thread pool to use for making batch requests to the LanceDB Cloud API.
-        If an integer, then a ThreadPoolExecutor will be created with that
-        number of threads. If None, then a ThreadPoolExecutor will be created
-        with the default number of threads. If a ThreadPoolExecutor, then that
-        executor will be used for making requests. This is for LanceDB Cloud
-        only and is only used when making batch requests (i.e., passing in
-        multiple queries to the search method at once).
+    client_config: ClientConfig or dict, optional
+        Configuration options for the LanceDB Cloud HTTP client. If a dict, then
+        the keys are the attributes of the ClientConfig class. If None, then the
+        default configuration is used.
 
     Examples
     --------
@@ -92,6 +89,8 @@ def connect(
     conn : DBConnection
         A connection to a LanceDB database.
     """
+    from .remote.db import RemoteDBConnection
+
     if isinstance(uri, str) and uri.startswith("db://"):
         if api_key is None:
             api_key = os.environ.get("LANCEDB_API_KEY")
@@ -104,7 +103,9 @@ def connect(
             api_key,
             region,
             host_override,
+            # TODO: remove this (deprecation warning downstream)
             request_thread_pool=request_thread_pool,
+            client_config=client_config,
             **kwargs,
         )
 
@@ -120,7 +121,7 @@ async def connect_async(
     region: str = "us-east-1",
     host_override: Optional[str] = None,
     read_consistency_interval: Optional[timedelta] = None,
-    request_thread_pool: Optional[Union[int, ThreadPoolExecutor]] = None,
+    client_config: Optional[Union[ClientConfig, Dict[str, Any]]] = None,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> AsyncConnection:
     """Connect to a LanceDB database.
@@ -148,6 +149,10 @@ async def connect_async(
         the last check, then the table will be checked for updates. Note: this
         consistency only applies to read operations. Write operations are
         always consistent.
+    client_config: ClientConfig or dict, optional
+        Configuration options for the LanceDB Cloud HTTP client. If a dict, then
+        the keys are the attributes of the ClientConfig class. If None, then the
+        default configuration is used.
     storage_options: dict, optional
         Additional options for the storage backend. See available options at
         https://lancedb.github.io/lancedb/guides/storage/
@@ -160,7 +165,13 @@ async def connect_async(
     ...     # For a local directory, provide a path to the database
     ...     db = await lancedb.connect_async("~/.lancedb")
     ...     # For object storage, use a URI prefix
-    ...     db = await lancedb.connect_async("s3://my-bucket/lancedb")
+    ...     db = await lancedb.connect_async("s3://my-bucket/lancedb",
+    ...                                      storage_options={
+    ...                                          "aws_access_key_id": "***"})
+    ...     # Connect to LanceDB cloud
+    ...     db = await lancedb.connect_async("db://my_database", api_key="ldb_...",
+    ...                                      client_config={
+    ...                                          "retry_config": {"retries": 5}})
 
     Returns
     -------
@@ -172,6 +183,9 @@ async def connect_async(
     else:
         read_consistency_interval_secs = None
 
+    if isinstance(client_config, dict):
+        client_config = ClientConfig(**client_config)
+
     return AsyncConnection(
         await lancedb_connect(
             sanitize_uri(uri),
@@ -179,6 +193,7 @@ async def connect_async(
             region,
             host_override,
             read_consistency_interval_secs,
+            client_config,
             storage_options,
         )
     )

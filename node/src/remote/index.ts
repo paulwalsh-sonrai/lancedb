@@ -72,6 +72,7 @@ export class RemoteConnection implements Connection {
     this._client = new HttpLancedbClient(
       server,
       opts.apiKey,
+      opts.timeout,
       opts.hostOverride === undefined ? undefined : this._dbName
     )
   }
@@ -237,16 +238,18 @@ export class RemoteQuery<T = number[]> extends Query<T> {
       (this as any)._prefilter,
       (this as any)._refineFactor,
       (this as any)._select,
-      (this as any)._filter
+      (this as any)._filter,
+      (this as any)._metricType,
+      (this as any)._fastSearch
     )
 
     return data.toArray().map((entry: Record<string, unknown>) => {
       const newObject: Record<string, unknown> = {}
       Object.keys(entry).forEach((key: string) => {
         if (entry[key] instanceof Vector) {
-          newObject[key] = (entry[key] as Vector).toArray()
+          newObject[key] = (entry[key] as any).toArray()
         } else {
-          newObject[key] = entry[key]
+          newObject[key] = entry[key] as any
         }
       })
       return newObject as unknown as T
@@ -509,18 +512,21 @@ export class RemoteTable<T = number[]> implements Table<T> {
     return (await results.body()).indexes?.map((index: any) => ({
       columns: index.columns,
       name: index.index_name,
-      uuid: index.index_uuid
+      uuid: index.index_uuid,
+      status: index.status
     }))
   }
 
-  async indexStats (indexUuid: string): Promise<IndexStats> {
+  async indexStats (indexName: string): Promise<IndexStats> {
     const results = await this._client.post(
-      `/v1/table/${encodeURIComponent(this._name)}/index/${indexUuid}/stats/`
+      `/v1/table/${encodeURIComponent(this._name)}/index/${indexName}/stats/`
     )
     const body = await results.body()
     return {
       numIndexedRows: body?.num_indexed_rows,
-      numUnindexedRows: body?.num_unindexed_rows
+      numUnindexedRows: body?.num_unindexed_rows,
+      indexType: body?.index_type,
+      distanceType: body?.distance_type
     }
   }
 

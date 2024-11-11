@@ -21,14 +21,14 @@ use std::sync::Arc;
 use arrow::array::AsArray;
 use arrow::datatypes::Float32Type;
 use arrow_array::{RecordBatchIterator, RecordBatchReader};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use chrono::Duration;
+use datafusion_physical_plan::display::DisplayableExecutionPlan;
+use datafusion_physical_plan::ExecutionPlan;
+use futures::{StreamExt, TryStreamExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::RemovalStats;
-use lance::dataset::optimize::{
-    compact_files, CompactionMetrics, CompactionOptions, IndexRemapperOptions,
-};
+use lance::dataset::optimize::{compact_files, CompactionMetrics, IndexRemapperOptions};
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
 pub use lance::dataset::ColumnAlteration;
 pub use lance::dataset::NewColumnTransform;
@@ -38,30 +38,123 @@ use lance::dataset::{
 };
 use lance::dataset::{MergeInsertBuilder as LanceMergeInsertBuilder, WhenNotMatchedBySource};
 use lance::io::WrappingObjectStore;
+use lance_datafusion::exec::execute_plan;
+use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::ivf::IvfBuildParams;
+use lance_index::vector::pq::PQBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
+use lance_index::DatasetIndexExt;
 use lance_index::IndexType;
-use lance_index::{optimize::OptimizeOptions, DatasetIndexExt};
+use lance_table::io::commit::ManifestNamingScheme;
 use log::info;
-use snafu::whatever;
+use serde::{Deserialize, Serialize};
 
 use crate::arrow::IntoArrow;
 use crate::connection::NoData;
+use crate::embeddings::{EmbeddingDefinition, EmbeddingRegistry, MaybeEmbedded, MemoryRegistry};
 use crate::error::{Error, Result};
-use crate::index::vector::{IvfPqIndexBuilder, VectorIndex, VectorIndexStatistics};
-use crate::index::IndexConfig;
+use crate::index::scalar::FtsIndexBuilder;
+use crate::index::vector::{
+    suggested_num_partitions_for_hnsw, IvfHnswPqIndexBuilder, IvfHnswSqIndexBuilder,
+    IvfPqIndexBuilder, VectorIndex,
+};
+use crate::index::IndexStatistics;
 use crate::index::{
     vector::{suggested_num_partitions, suggested_num_sub_vectors},
     Index, IndexBuilder,
 };
+use crate::index::{IndexConfig, IndexStatisticsImpl};
 use crate::query::{
     IntoQueryVector, Query, QueryExecutionOptions, Select, VectorQuery, DEFAULT_TOP_K,
 };
-use crate::utils::{default_vector_column, PatchReadParam, PatchWriteParam};
+use crate::utils::{
+    default_vector_column, supported_bitmap_data_type, supported_btree_data_type,
+    supported_fts_data_type, supported_label_list_data_type, supported_vector_data_type,
+    PatchReadParam, PatchWriteParam,
+};
 
 use self::dataset::DatasetConsistencyWrapper;
 use self::merge::MergeInsertBuilder;
 
 pub(crate) mod dataset;
 pub mod merge;
+
+pub use chrono::Duration;
+pub use lance::dataset::optimize::CompactionOptions;
+pub use lance_index::optimize::OptimizeOptions;
+
+/// Defines the type of column
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ColumnKind {
+    /// Columns populated by data from the user (this is the most common case)
+    Physical,
+    /// Columns populated by applying an embedding function to the input
+    Embedding(EmbeddingDefinition),
+}
+
+/// Defines a column in a table
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnDefinition {
+    /// The source of the column data
+    pub kind: ColumnKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct TableDefinition {
+    pub column_definitions: Vec<ColumnDefinition>,
+    pub schema: SchemaRef,
+}
+
+impl TableDefinition {
+    pub fn new(schema: SchemaRef, column_definitions: Vec<ColumnDefinition>) -> Self {
+        Self {
+            column_definitions,
+            schema,
+        }
+    }
+
+    pub fn new_from_schema(schema: SchemaRef) -> Self {
+        let column_definitions = schema
+            .fields()
+            .iter()
+            .map(|_| ColumnDefinition {
+                kind: ColumnKind::Physical,
+            })
+            .collect();
+        Self::new(schema, column_definitions)
+    }
+
+    pub fn try_from_rich_schema(schema: SchemaRef) -> Result<Self> {
+        let column_definitions = schema.metadata.get("lancedb::column_definitions");
+        if let Some(column_definitions) = column_definitions {
+            let column_definitions: Vec<ColumnDefinition> =
+                serde_json::from_str(column_definitions).map_err(|e| Error::Runtime {
+                    message: format!("Failed to deserialize column definitions: {}", e),
+                })?;
+            Ok(Self::new(schema, column_definitions))
+        } else {
+            let column_definitions = schema
+                .fields()
+                .iter()
+                .map(|_| ColumnDefinition {
+                    kind: ColumnKind::Physical,
+                })
+                .collect();
+            Ok(Self::new(schema, column_definitions))
+        }
+    }
+
+    pub fn into_rich_schema(self) -> SchemaRef {
+        // We have full control over the structure of column definitions.  This should
+        // not fail, except for a bug
+        let lancedb_metadata = serde_json::to_string(&self.column_definitions).unwrap();
+        let mut schema_with_metadata = (*self.schema).clone();
+        schema_with_metadata
+            .metadata
+            .insert("lancedb::column_definitions".to_string(), lancedb_metadata);
+        Arc::new(schema_with_metadata)
+    }
+}
 
 /// Optimize the dataset.
 ///
@@ -70,22 +163,60 @@ pub mod merge;
 ///
 /// By default, it optimizes everything, as [`OptimizeAction::All`].
 pub enum OptimizeAction {
-    /// Run optimization on every, with default options.
+    /// Run all optimizations with default values
     All,
-    /// Compact files in the dataset
+    /// Compacts files in the dataset
+    ///
+    /// LanceDb uses a readonly filesystem for performance and safe concurrency.  Every time
+    /// new data is added it will be added into new files.  Small files
+    /// can hurt both read and write performance.  Compaction will merge small files
+    /// into larger ones.
+    ///
+    /// All operations that modify data (add, delete, update, merge insert, etc.) will create
+    /// new files.  If these operations are run frequently then compaction should run frequently.
+    ///
+    /// If these operations are never run (search only) then compaction is not necessary.
     Compact {
         options: CompactionOptions,
         remap_options: Option<Arc<dyn IndexRemapperOptions>>,
     },
-    /// Prune old version of datasets.
+    /// Prune old version of datasets
+    ///
+    /// Every change in LanceDb is additive.  When data is removed from a dataset a new version is
+    /// created that doesn't contain the removed data.  However, the old version, which does contain
+    /// the removed data, is left in place.  This is necessary for consistency and concurrency and
+    /// also enables time travel functionality like the ability to checkout an older version of the
+    /// dataset to undo changes.
+    ///
+    /// Over time, these old versions can consume a lot of disk space.  The prune operation will
+    /// remove versions of the dataset that are older than a certain age.  This will free up the
+    /// space used by that old data.
+    ///
+    /// Once a version is pruned it can no longer be checked out.
     Prune {
         /// The duration of time to keep versions of the dataset.
-        older_than: Duration,
+        older_than: Option<Duration>,
         /// Because they may be part of an in-progress transaction, files newer than 7 days old are not deleted by default.
         /// If you are sure that there are no in-progress transactions, then you can set this to True to delete all files older than `older_than`.
         delete_unverified: Option<bool>,
+        /// If true, an error will be returned if there are any old versions that are still tagged.
+        error_if_tagged_old_versions: Option<bool>,
     },
-    /// Optimize index.
+    /// Optimize the indices
+    ///
+    /// This operation optimizes all indices in the table.  When new data is added to LanceDb
+    /// it is not added to the indices.  However, it can still turn up in searches because the search
+    /// function will scan both the indexed data and the unindexed data in parallel.  Over time, the
+    /// unindexed data can become large enough that the search performance is slow.  This operation
+    /// will add the unindexed data to the indices without rerunning the full index creation process.
+    ///
+    /// Optimizing an index is faster than re-training the index but it does not typically adjust the
+    /// underlying model relied upon by the index.  This can eventually lead to poor search accuracy
+    /// and so users may still want to occasionally retrain the index after adding a large amount of
+    /// data.
+    ///
+    /// For example, when using IVF, an index will create clusters.  Optimizing an index assigns unindexed
+    /// data to the existing clusters, but it does not move the clusters or create new clusters.
     Index(OptimizeOptions),
 }
 
@@ -112,7 +243,8 @@ pub struct WriteOptions {
     // pub on_bad_vectors: BadVectorHandling,
     /// Advanced parameters that can be used to customize table creation
     ///
-    /// If set, these will take precedence over any overlapping `OpenTableBuilder` options
+    /// Overlapping `OpenTableBuilder` options (e.g. [AddDataBuilder::mode]) will take
+    /// precedence over their counterparts in `WriteOptions` (e.g. [WriteParams::mode]).
     pub lance_write_params: Option<WriteParams>,
 }
 
@@ -132,6 +264,7 @@ pub struct AddDataBuilder<T: IntoArrow> {
     pub(crate) data: T,
     pub(crate) mode: AddDataMode,
     pub(crate) write_options: WriteOptions,
+    embedding_registry: Option<Arc<dyn EmbeddingRegistry>>,
 }
 
 impl<T: IntoArrow> std::fmt::Debug for AddDataBuilder<T> {
@@ -163,6 +296,7 @@ impl<T: IntoArrow> AddDataBuilder<T> {
             mode: self.mode,
             parent: self.parent,
             write_options: self.write_options,
+            embedding_registry: self.embedding_registry,
         };
         parent.add(without_data, data).await
     }
@@ -221,8 +355,9 @@ impl UpdateBuilder {
         self
     }
 
-    /// Executes the update operation
-    pub async fn execute(self) -> Result<()> {
+    /// Executes the update operation.
+    /// Returns the number of rows that were updated.
+    pub async fn execute(self) -> Result<u64> {
         if self.columns.is_empty() {
             Err(Error::InvalidInput {
                 message: "at least one column must be specified in an update operation".to_string(),
@@ -235,6 +370,7 @@ impl UpdateBuilder {
 
 #[async_trait]
 pub(crate) trait TableInternal: std::fmt::Display + std::fmt::Debug + Send + Sync {
+    #[allow(dead_code)]
     fn as_any(&self) -> &dyn std::any::Any;
     /// Cast as [`NativeTable`], or return None it if is not a [`NativeTable`].
     fn as_native(&self) -> Option<&NativeTable>;
@@ -244,25 +380,32 @@ pub(crate) trait TableInternal: std::fmt::Display + std::fmt::Debug + Send + Syn
     async fn schema(&self) -> Result<SchemaRef>;
     /// Count the number of rows in this table.
     async fn count_rows(&self, filter: Option<String>) -> Result<usize>;
+    async fn create_plan(
+        &self,
+        query: &VectorQuery,
+        options: QueryExecutionOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>>;
     async fn plain_query(
         &self,
         query: &Query,
         options: QueryExecutionOptions,
     ) -> Result<DatasetRecordBatchStream>;
-    async fn vector_query(
-        &self,
-        query: &VectorQuery,
-        options: QueryExecutionOptions,
-    ) -> Result<DatasetRecordBatchStream>;
+    async fn explain_plan(&self, query: &VectorQuery, verbose: bool) -> Result<String> {
+        let plan = self.create_plan(query, Default::default()).await?;
+        let display = DisplayableExecutionPlan::new(plan.as_ref());
+
+        Ok(format!("{}", display.indent(verbose)))
+    }
     async fn add(
         &self,
         add: AddDataBuilder<NoData>,
         data: Box<dyn arrow_array::RecordBatchReader + Send>,
     ) -> Result<()>;
     async fn delete(&self, predicate: &str) -> Result<()>;
-    async fn update(&self, update: UpdateBuilder) -> Result<()>;
+    async fn update(&self, update: UpdateBuilder) -> Result<u64>;
     async fn create_index(&self, index: IndexBuilder) -> Result<()>;
     async fn list_indices(&self) -> Result<Vec<IndexConfig>>;
+    async fn index_stats(&self, index_name: &str) -> Result<Option<IndexStatistics>>;
     async fn merge_insert(
         &self,
         params: MergeInsertBuilder,
@@ -280,6 +423,8 @@ pub(crate) trait TableInternal: std::fmt::Display + std::fmt::Debug + Send + Syn
     async fn checkout(&self, version: u64) -> Result<()>;
     async fn checkout_latest(&self) -> Result<()>;
     async fn restore(&self) -> Result<()>;
+    async fn table_definition(&self) -> Result<TableDefinition>;
+    fn dataset_uri(&self) -> &str;
 }
 
 /// A Table is a collection of strong typed Rows.
@@ -288,6 +433,32 @@ pub(crate) trait TableInternal: std::fmt::Display + std::fmt::Debug + Send + Syn
 #[derive(Clone)]
 pub struct Table {
     inner: Arc<dyn TableInternal>,
+    embedding_registry: Arc<dyn EmbeddingRegistry>,
+}
+
+#[cfg(all(test, feature = "remote"))]
+mod test_utils {
+    use super::*;
+
+    impl Table {
+        pub fn new_with_handler<T>(
+            name: impl Into<String>,
+            handler: impl Fn(reqwest::Request) -> http::Response<T> + Clone + Send + Sync + 'static,
+        ) -> Self
+        where
+            T: Into<reqwest::Body>,
+        {
+            let inner = Arc::new(crate::remote::table::RemoteTable::new_mock(
+                name.into(),
+                handler,
+            ));
+            Self {
+                inner,
+                // Registry is unused.
+                embedding_registry: Arc::new(MemoryRegistry::new()),
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for Table {
@@ -298,7 +469,20 @@ impl std::fmt::Display for Table {
 
 impl Table {
     pub(crate) fn new(inner: Arc<dyn TableInternal>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            embedding_registry: Arc::new(MemoryRegistry::new()),
+        }
+    }
+
+    pub(crate) fn new_with_embedding_registry(
+        inner: Arc<dyn TableInternal>,
+        embedding_registry: Arc<dyn EmbeddingRegistry>,
+    ) -> Self {
+        Self {
+            inner,
+            embedding_registry,
+        }
     }
 
     /// Cast as [`NativeTable`], or return None it if is not a [`NativeTable`].
@@ -340,6 +524,7 @@ impl Table {
             data: batches,
             mode: AddDataMode::Append,
             write_options: WriteOptions::default(),
+            embedding_registry: Some(self.embedding_registry.clone()),
         }
     }
 
@@ -423,7 +608,8 @@ impl Table {
     /// There are a variety of indices available.  They are described more in
     /// [`crate::index::Index`].  The simplest thing to do is to use `index::Index::Auto` which
     /// will attempt to create the most useful index based on the column type and column
-    /// statistics.
+    /// statistics. `BTree` index is created by default for numeric, temporal, and
+    /// string columns.
     ///
     /// Once an index is created it will remain until the data is overwritten (e.g. an
     /// add operation with mode overwrite) or the indexed column is dropped.
@@ -457,10 +643,21 @@ impl Table {
     ///     .await
     ///     .unwrap();
     /// # let tbl = db.open_table("idx_test").execute().await.unwrap();
+    /// // Create IVF PQ index on the "vector" column by default.
     /// tbl.create_index(&["vector"], Index::Auto)
     ///    .execute()
     ///    .await
     ///    .unwrap();
+    /// // Create a BTree index on the "id" column.
+    /// tbl.create_index(&["id"], Index::Auto)
+    ///     .execute()
+    ///     .await
+    ///     .unwrap();
+    /// // Create a LabelList index on the "tags" column.
+    /// tbl.create_index(&["tags"], Index::LabelList(Default::default()))
+    ///     .execute()
+    ///     .await
+    ///     .unwrap();
     /// # });
     /// ```
     pub fn create_index(&self, columns: &[impl AsRef<str>], index: Index) -> IndexBuilder {
@@ -658,10 +855,30 @@ impl Table {
 
     /// Optimize the on-disk data and indices for better performance.
     ///
+    /// Modeled after ``VACUUM`` in PostgreSQL.
+    ///
+    /// Optimization is discussed in more detail in the [OptimizeAction] documentation
+    /// and covers three operations:
+    ///
+    ///  * Compaction: Merges small files into larger ones
+    ///  * Prune: Removes old versions of the dataset
+    ///  * Index: Optimizes the indices, adding new data to existing indices
+    ///
     /// <section class="warning">Experimental API</section>
     ///
-    /// Modeled after ``VACUUM`` in PostgreSQL.
-    /// Not all implementations support explicit optimization.
+    /// The optimization process is undergoing active development and may change.
+    /// Our goal with these changes is to improve the performance of optimization and
+    /// reduce the complexity.
+    ///
+    /// That being said, it is essential today to run optimize if you want the best
+    /// performance.  It should be stable and safe to use in production, but it our
+    /// hope that the API may be simplified (or not even need to be called) in the future.
+    ///
+    /// The frequency an application shoudl call optimize is based on the frequency of
+    /// data modifications.  If data is frequently added, deleted, or updated then
+    /// optimize should be run frequently.  A good rule of thumb is to run optimize if
+    /// you have added or modified 100,000 or more records or run more than 20 data
+    /// modification operations.
     pub async fn optimize(&self, action: OptimizeAction) -> Result<OptimizeStats> {
         self.inner.optimize(action).await
     }
@@ -739,15 +956,30 @@ impl Table {
     pub async fn list_indices(&self) -> Result<Vec<IndexConfig>> {
         self.inner.list_indices().await
     }
+
+    /// Get the underlying dataset URI
+    ///
+    /// Warning: This is an internal API and the return value is subject to change.
+    pub fn dataset_uri(&self) -> &str {
+        self.inner.dataset_uri()
+    }
+
+    /// Get statistics about an index.
+    /// Returns None if the index does not exist.
+    pub async fn index_stats(
+        &self,
+        index_name: impl AsRef<str>,
+    ) -> Result<Option<IndexStatistics>> {
+        self.inner.index_stats(index_name.as_ref()).await
+    }
 }
 
 impl From<NativeTable> for Table {
     fn from(table: NativeTable) -> Self {
-        Self {
-            inner: Arc::new(table),
-        }
+        Self::new(Arc::new(table))
     }
 }
+
 /// A table in a LanceDB database.
 #[derive(Debug, Clone)]
 pub struct NativeTable {
@@ -870,28 +1102,6 @@ impl NativeTable {
         Ok(name.to_string())
     }
 
-    fn supported_btree_data_type(dtype: &DataType) -> bool {
-        dtype.is_integer()
-            || dtype.is_floating()
-            || matches!(
-                dtype,
-                DataType::Boolean
-                    | DataType::Utf8
-                    | DataType::Time32(_)
-                    | DataType::Time64(_)
-                    | DataType::Date32
-                    | DataType::Date64
-                    | DataType::Timestamp(_, _)
-            )
-    }
-
-    fn supported_vector_data_type(dtype: &DataType) -> bool {
-        match dtype {
-            DataType::FixedSizeList(inner, _) => DataType::is_floating(inner.data_type()),
-            _ => false,
-        }
-    }
-
     /// Creates a new Table
     ///
     /// # Arguments
@@ -912,13 +1122,15 @@ impl NativeTable {
         params: Option<WriteParams>,
         read_consistency_interval: Option<std::time::Duration>,
     ) -> Result<Self> {
-        let params = params.unwrap_or_default();
+        // Default params uses format v1.
+        let params = params.unwrap_or(WriteParams {
+            ..Default::default()
+        });
         // patch the params if we have a write store wrapper
         let params = match write_store_wrapper.clone() {
             Some(wrapper) => params.patch_with_store_wrapper(wrapper)?,
             None => params,
         };
-
         let storage_options = params
             .store_params
             .clone()
@@ -1004,12 +1216,13 @@ impl NativeTable {
         &self,
         older_than: Duration,
         delete_unverified: Option<bool>,
+        error_if_tagged_old_versions: Option<bool>,
     ) -> Result<RemovalStats> {
         Ok(self
             .dataset
             .get_mut()
             .await?
-            .cleanup_old_versions(older_than, delete_unverified)
+            .cleanup_old_versions(older_than, delete_unverified, error_if_tagged_old_versions)
             .await?)
     }
 
@@ -1047,40 +1260,6 @@ impl NativeTable {
             .await)
     }
 
-    pub async fn count_indexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
-        match self.load_index_stats(index_uuid).await? {
-            Some(stats) => Ok(Some(stats.num_indexed_rows)),
-            None => Ok(None),
-        }
-    }
-
-    pub async fn count_unindexed_rows(&self, index_uuid: &str) -> Result<Option<usize>> {
-        match self.load_index_stats(index_uuid).await? {
-            Some(stats) => Ok(Some(stats.num_unindexed_rows)),
-            None => Ok(None),
-        }
-    }
-
-    pub async fn get_index_type(&self, index_uuid: &str) -> Result<Option<String>> {
-        match self.load_index_stats(index_uuid).await? {
-            Some(stats) => Ok(Some(stats.index_type)),
-            None => Ok(None),
-        }
-    }
-
-    pub async fn get_distance_type(&self, index_uuid: &str) -> Result<Option<String>> {
-        match self.load_index_stats(index_uuid).await? {
-            Some(stats) => Ok(Some(
-                stats
-                    .indices
-                    .iter()
-                    .map(|i| i.metric_type.clone())
-                    .collect(),
-            )),
-            None => Ok(None),
-        }
-    }
-
     pub async fn load_indices(&self) -> Result<Vec<VectorIndex>> {
         let dataset = self.dataset.get().await?;
         let (indices, mf) = futures::try_join!(dataset.load_indices(), dataset.latest_manifest())?;
@@ -1090,32 +1269,13 @@ impl NativeTable {
             .collect())
     }
 
-    async fn load_index_stats(&self, index_uuid: &str) -> Result<Option<VectorIndexStatistics>> {
-        let index = self
-            .load_indices()
-            .await?
-            .into_iter()
-            .find(|i| i.index_uuid == index_uuid);
-        if index.is_none() {
-            return Ok(None);
-        }
-        let dataset = self.dataset.get().await?;
-        let index_stats = dataset.index_statistics(&index.unwrap().index_name).await?;
-        let index_stats: VectorIndexStatistics = whatever!(
-            serde_json::from_str(&index_stats),
-            "error deserializing index statistics {index_stats}",
-        );
-
-        Ok(Some(index_stats))
-    }
-
     async fn create_ivf_pq_index(
         &self,
         index: IvfPqIndexBuilder,
         field: &Field,
         replace: bool,
     ) -> Result<()> {
-        if !Self::supported_vector_data_type(field.data_type()) {
+        if !supported_vector_data_type(field.data_type()) {
             return Err(Error::InvalidInput {
                 message: format!(
                     "An IVF PQ index cannot be created on the column `{}` which has data type {}",
@@ -1147,7 +1307,6 @@ impl NativeTable {
             num_partitions as usize,
             /*num_bits=*/ 8,
             num_sub_vectors as usize,
-            false,
             index.distance_type.into(),
             index.max_iterations as usize,
         );
@@ -1163,11 +1322,140 @@ impl NativeTable {
         Ok(())
     }
 
+    async fn create_ivf_hnsw_pq_index(
+        &self,
+        index: IvfHnswPqIndexBuilder,
+        field: &Field,
+        replace: bool,
+    ) -> Result<()> {
+        if !supported_vector_data_type(field.data_type()) {
+            return Err(Error::InvalidInput {
+                message: format!(
+                    "An IVF HNSW PQ index cannot be created on the column `{}` which has data type {}",
+                    field.name(),
+                    field.data_type()
+                ),
+            });
+        }
+
+        let num_partitions: u32 = if let Some(n) = index.num_partitions {
+            n
+        } else {
+            match field.data_type() {
+                arrow_schema::DataType::FixedSizeList(_, n) => Ok::<u32, Error>(
+                    suggested_num_partitions_for_hnsw(self.count_rows(None).await?, *n as u32),
+                ),
+                _ => Err(Error::Schema {
+                    message: format!("Column '{}' is not a FixedSizeList", field.name()),
+                }),
+            }?
+        };
+
+        let num_sub_vectors: u32 = if let Some(n) = index.num_sub_vectors {
+            n
+        } else {
+            match field.data_type() {
+                arrow_schema::DataType::FixedSizeList(_, n) => {
+                    Ok::<u32, Error>(suggested_num_sub_vectors(*n as u32))
+                }
+                _ => Err(Error::Schema {
+                    message: format!("Column '{}' is not a FixedSizeList", field.name()),
+                }),
+            }?
+        };
+
+        let mut dataset = self.dataset.get_mut().await?;
+        let mut ivf_params = IvfBuildParams::new(num_partitions as usize);
+        ivf_params.sample_rate = index.sample_rate as usize;
+        ivf_params.max_iters = index.max_iterations as usize;
+        let hnsw_params = HnswBuildParams::default()
+            .num_edges(index.m as usize)
+            .ef_construction(index.ef_construction as usize);
+        let pq_params = PQBuildParams {
+            num_sub_vectors: num_sub_vectors as usize,
+            ..Default::default()
+        };
+        let lance_idx_params = lance::index::vector::VectorIndexParams::with_ivf_hnsw_pq_params(
+            index.distance_type.into(),
+            ivf_params,
+            hnsw_params,
+            pq_params,
+        );
+        dataset
+            .create_index(
+                &[field.name()],
+                IndexType::Vector,
+                None,
+                &lance_idx_params,
+                replace,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn create_ivf_hnsw_sq_index(
+        &self,
+        index: IvfHnswSqIndexBuilder,
+        field: &Field,
+        replace: bool,
+    ) -> Result<()> {
+        if !supported_vector_data_type(field.data_type()) {
+            return Err(Error::InvalidInput {
+                message: format!(
+                    "An IVF HNSW SQ index cannot be created on the column `{}` which has data type {}",
+                    field.name(),
+                    field.data_type()
+                ),
+            });
+        }
+
+        let num_partitions: u32 = if let Some(n) = index.num_partitions {
+            n
+        } else {
+            match field.data_type() {
+                arrow_schema::DataType::FixedSizeList(_, n) => Ok::<u32, Error>(
+                    suggested_num_partitions_for_hnsw(self.count_rows(None).await?, *n as u32),
+                ),
+                _ => Err(Error::Schema {
+                    message: format!("Column '{}' is not a FixedSizeList", field.name()),
+                }),
+            }?
+        };
+
+        let mut dataset = self.dataset.get_mut().await?;
+        let mut ivf_params = IvfBuildParams::new(num_partitions as usize);
+        ivf_params.sample_rate = index.sample_rate as usize;
+        ivf_params.max_iters = index.max_iterations as usize;
+        let hnsw_params = HnswBuildParams::default()
+            .num_edges(index.m as usize)
+            .ef_construction(index.ef_construction as usize);
+        let sq_params = SQBuildParams {
+            sample_rate: index.sample_rate as usize,
+            ..Default::default()
+        };
+        let lance_idx_params = lance::index::vector::VectorIndexParams::with_ivf_hnsw_sq_params(
+            index.distance_type.into(),
+            ivf_params,
+            hnsw_params,
+            sq_params,
+        );
+        dataset
+            .create_index(
+                &[field.name()],
+                IndexType::Vector,
+                None,
+                &lance_idx_params,
+                replace,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn create_auto_index(&self, field: &Field, opts: IndexBuilder) -> Result<()> {
-        if Self::supported_vector_data_type(field.data_type()) {
+        if supported_vector_data_type(field.data_type()) {
             self.create_ivf_pq_index(IvfPqIndexBuilder::default(), field, opts.replace)
                 .await
-        } else if Self::supported_btree_data_type(field.data_type()) {
+        } else if supported_btree_data_type(field.data_type()) {
             self.create_btree_index(field, opts).await
         } else {
             Err(Error::InvalidInput {
@@ -1181,7 +1469,7 @@ impl NativeTable {
     }
 
     async fn create_btree_index(&self, field: &Field, opts: IndexBuilder) -> Result<()> {
-        if !Self::supported_btree_data_type(field.data_type()) {
+        if !supported_btree_data_type(field.data_type()) {
             return Err(Error::Schema {
                 message: format!(
                     "A BTree index cannot be created on the field `{}` which has data type {}",
@@ -1192,14 +1480,103 @@ impl NativeTable {
         }
 
         let mut dataset = self.dataset.get_mut().await?;
-        let lance_idx_params = lance::index::scalar::ScalarIndexParams {};
+        let lance_idx_params = lance_index::scalar::ScalarIndexParams {
+            force_index_type: Some(lance_index::scalar::ScalarIndexType::BTree),
+        };
         dataset
             .create_index(
                 &[field.name()],
-                IndexType::Scalar,
+                IndexType::BTree,
                 None,
                 &lance_idx_params,
                 opts.replace,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn create_bitmap_index(&self, field: &Field, opts: IndexBuilder) -> Result<()> {
+        if !supported_bitmap_data_type(field.data_type()) {
+            return Err(Error::Schema {
+                message: format!(
+                    "A Bitmap index cannot be created on the field `{}` which has data type {}",
+                    field.name(),
+                    field.data_type()
+                ),
+            });
+        }
+
+        let mut dataset = self.dataset.get_mut().await?;
+        let lance_idx_params = lance_index::scalar::ScalarIndexParams {
+            force_index_type: Some(lance_index::scalar::ScalarIndexType::Bitmap),
+        };
+        dataset
+            .create_index(
+                &[field.name()],
+                IndexType::Bitmap,
+                None,
+                &lance_idx_params,
+                opts.replace,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn create_label_list_index(&self, field: &Field, opts: IndexBuilder) -> Result<()> {
+        if !supported_label_list_data_type(field.data_type()) {
+            return Err(Error::Schema {
+                message: format!(
+                    "A LabelList index cannot be created on the field `{}` which has data type {}",
+                    field.name(),
+                    field.data_type()
+                ),
+            });
+        }
+
+        let mut dataset = self.dataset.get_mut().await?;
+        let lance_idx_params = lance_index::scalar::ScalarIndexParams {
+            force_index_type: Some(lance_index::scalar::ScalarIndexType::LabelList),
+        };
+        dataset
+            .create_index(
+                &[field.name()],
+                IndexType::LabelList,
+                None,
+                &lance_idx_params,
+                opts.replace,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn create_fts_index(
+        &self,
+        field: &Field,
+        fts_opts: FtsIndexBuilder,
+        replace: bool,
+    ) -> Result<()> {
+        if !supported_fts_data_type(field.data_type()) {
+            return Err(Error::Schema {
+                message: format!(
+                    "A FTS index cannot be created on the field `{}` which has data type {}",
+                    field.name(),
+                    field.data_type()
+                ),
+            });
+        }
+
+        let mut dataset = self.dataset.get_mut().await?;
+        let fts_params = lance_index::scalar::InvertedIndexParams {
+            with_position: fts_opts.with_position,
+            tokenizer_config: fts_opts.tokenizer_configs,
+        };
+        dataset
+            .create_index(
+                &[field.name()],
+                IndexType::Inverted,
+                None,
+                &fts_params,
+                replace,
             )
             .await?;
         Ok(())
@@ -1210,79 +1587,40 @@ impl NativeTable {
         query: &VectorQuery,
         options: QueryExecutionOptions,
     ) -> Result<DatasetRecordBatchStream> {
-        let ds_ref = self.dataset.get().await?;
-        let mut scanner: Scanner = ds_ref.scan();
+        let plan = self.create_plan(query, options).await?;
+        Ok(DatasetRecordBatchStream::new(execute_plan(
+            plan,
+            Default::default(),
+        )?))
+    }
 
-        if let Some(query_vector) = query.query_vector.as_ref() {
-            // If there is a vector query, default to limit=10 if unspecified
-            let column = if let Some(col) = query.column.as_ref() {
-                col.clone()
-            } else {
-                // Infer a vector column with the same dimension of the query vector.
-                let arrow_schema = Schema::from(ds_ref.schema());
-                default_vector_column(&arrow_schema, Some(query_vector.len() as i32))?
-            };
-            let field = ds_ref.schema().field(&column).ok_or(Error::Schema {
-                message: format!("Column {} not found in dataset schema", column),
-            })?;
-            if let arrow_schema::DataType::FixedSizeList(f, dim) = field.data_type() {
-                if !f.data_type().is_floating() {
-                    return Err(Error::InvalidInput {
-                        message: format!(
-                            "The data type of the vector column '{}' is not a floating point type",
-                            column
-                        ),
-                    });
-                }
-                if dim != query_vector.len() as i32 {
-                    return Err(Error::InvalidInput {
-                        message: format!(
-                            "The dimension of the query vector does not match with the dimension of the vector column '{}':
-                                query dim={}, expected vector dim={}",
-                            column,
-                            query_vector.len(),
-                            dim,
-                        ),
-                    });
-                }
-            }
-            let query_vector = query_vector.as_primitive::<Float32Type>();
-            scanner.nearest(
-                &column,
-                query_vector,
-                query.base.limit.unwrap_or(DEFAULT_TOP_K),
-            )?;
-        } else {
-            // If there is no vector query, it's ok to not have a limit
-            scanner.limit(query.base.limit.map(|limit| limit as i64), None)?;
-        }
-        scanner.nprobs(query.nprobes);
-        scanner.use_index(query.use_index);
-        scanner.prefilter(query.prefilter);
-        scanner.batch_size(options.max_batch_length as usize);
+    /// Check whether the table uses V2 manifest paths.
+    ///
+    /// See [Self::migrate_manifest_paths_v2] and [ManifestNamingScheme] for
+    /// more information.
+    pub async fn uses_v2_manifest_paths(&self) -> Result<bool> {
+        let dataset = self.dataset.get().await?;
+        Ok(dataset.manifest_naming_scheme == ManifestNamingScheme::V2)
+    }
 
-        match &query.base.select {
-            Select::Columns(select) => {
-                scanner.project(select.as_slice())?;
-            }
-            Select::Dynamic(select_with_transform) => {
-                scanner.project_with_transform(select_with_transform.as_slice())?;
-            }
-            Select::All => { /* Do nothing */ }
-        }
-
-        if let Some(filter) = &query.base.filter {
-            scanner.filter(filter)?;
-        }
-
-        if let Some(refine_factor) = query.refine_factor {
-            scanner.refine(refine_factor);
-        }
-
-        if let Some(distance_type) = query.distance_type {
-            scanner.distance_metric(distance_type.into());
-        }
-        Ok(scanner.try_into_stream().await?)
+    /// Migrate the table to use the new manifest path scheme.
+    ///
+    /// This function will rename all V1 manifests to V2 manifest paths.
+    /// These paths provide more efficient opening of datasets with many versions
+    /// on object stores.
+    ///
+    /// This function is idempotent, and can be run multiple times without
+    /// changing the state of the object store.
+    ///
+    /// However, it should not be run while other concurrent operations are happening.
+    /// And it should also run until completion before resuming other operations.
+    ///
+    /// You can use [Self::uses_v2_manifest_paths] to check if the table is already
+    /// using V2 manifest paths.
+    pub async fn migrate_manifest_paths_v2(&self) -> Result<()> {
+        let mut dataset = self.dataset.get_mut().await?;
+        dataset.migrate_manifest_paths_v2().await?;
+        Ok(())
     }
 }
 
@@ -1342,6 +1680,11 @@ impl TableInternal for NativeTable {
         Ok(Arc::new(Schema::from(&lance_schema)))
     }
 
+    async fn table_definition(&self) -> Result<TableDefinition> {
+        let schema = self.schema().await?;
+        TableDefinition::try_from_rich_schema(schema)
+    }
+
     async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
         Ok(self.dataset.get().await?.count_rows(filter).await?)
     }
@@ -1351,6 +1694,9 @@ impl TableInternal for NativeTable {
         add: AddDataBuilder<NoData>,
         data: Box<dyn RecordBatchReader + Send>,
     ) -> Result<()> {
+        let data =
+            MaybeEmbedded::try_new(data, self.table_definition().await?, add.embedding_registry)?;
+
         let mut lance_params = add.write_options.lance_write_params.unwrap_or(WriteParams {
             mode: match add.mode {
                 AddDataMode::Append => WriteMode::Append,
@@ -1378,8 +1724,8 @@ impl TableInternal for NativeTable {
         };
 
         self.dataset.ensure_mutable().await?;
-
         let dataset = Dataset::write(data, &self.uri, Some(lance_params)).await?;
+
         self.dataset.set_latest(dataset).await;
         Ok(())
     }
@@ -1397,11 +1743,22 @@ impl TableInternal for NativeTable {
         match opts.index {
             Index::Auto => self.create_auto_index(field, opts).await,
             Index::BTree(_) => self.create_btree_index(field, opts).await,
+            Index::Bitmap(_) => self.create_bitmap_index(field, opts).await,
+            Index::LabelList(_) => self.create_label_list_index(field, opts).await,
+            Index::FTS(fts_opts) => self.create_fts_index(field, fts_opts, opts.replace).await,
             Index::IvfPq(ivf_pq) => self.create_ivf_pq_index(ivf_pq, field, opts.replace).await,
+            Index::IvfHnswPq(ivf_hnsw_pq) => {
+                self.create_ivf_hnsw_pq_index(ivf_hnsw_pq, field, opts.replace)
+                    .await
+            }
+            Index::IvfHnswSq(ivf_hnsw_sq) => {
+                self.create_ivf_hnsw_sq_index(ivf_hnsw_sq, field, opts.replace)
+                    .await
+            }
         }
     }
 
-    async fn update(&self, update: UpdateBuilder) -> Result<()> {
+    async fn update(&self, update: UpdateBuilder) -> Result<u64> {
         let dataset = self.dataset.get().await?.clone();
         let mut builder = LanceUpdateBuilder::new(Arc::new(dataset));
         if let Some(predicate) = update.filter {
@@ -1413,9 +1770,126 @@ impl TableInternal for NativeTable {
         }
 
         let operation = builder.build()?;
-        let ds = operation.execute().await?;
-        self.dataset.set_latest(ds.as_ref().clone()).await;
-        Ok(())
+        let res = operation.execute().await?;
+        self.dataset
+            .set_latest(res.new_dataset.as_ref().clone())
+            .await;
+        Ok(res.rows_updated)
+    }
+
+    async fn create_plan(
+        &self,
+        query: &VectorQuery,
+        options: QueryExecutionOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let ds_ref = self.dataset.get().await?;
+
+        let mut scanner: Scanner = ds_ref.scan();
+
+        if let Some(query_vector) = query.query_vector.as_ref() {
+            // If there is a vector query, default to limit=10 if unspecified
+            let column = if let Some(col) = query.column.as_ref() {
+                col.clone()
+            } else {
+                // Infer a vector column with the same dimension of the query vector.
+                let arrow_schema = Schema::from(ds_ref.schema());
+                default_vector_column(&arrow_schema, Some(query_vector.len() as i32))?
+            };
+
+            let field = ds_ref.schema().field(&column).ok_or(Error::Schema {
+                message: format!("Column {} not found in dataset schema", column),
+            })?;
+
+            if let arrow_schema::DataType::FixedSizeList(f, dim) = field.data_type() {
+                if !f.data_type().is_floating() {
+                    return Err(Error::InvalidInput {
+                        message: format!(
+                            "The data type of the vector column '{}' is not a floating point type",
+                            column
+                        ),
+                    });
+                }
+                if dim != query_vector.len() as i32 {
+                    return Err(Error::InvalidInput {
+                    message: format!(
+                        "The dimension of the query vector does not match with the dimension of the vector column '{}': \
+                            query dim={}, expected vector dim={}",
+                        column,
+                        query_vector.len(),
+                        dim,
+                    ),
+                });
+                }
+            }
+
+            let query_vector = query_vector.as_primitive::<Float32Type>();
+            scanner.nearest(
+                &column,
+                query_vector,
+                query.base.limit.unwrap_or(DEFAULT_TOP_K),
+            )?;
+            scanner.limit(
+                query.base.limit.map(|limit| limit as i64),
+                query.base.offset.map(|offset| offset as i64),
+            )?;
+        } else {
+            // If there is no vector query, it's ok to not have a limit
+            scanner.limit(
+                query.base.limit.map(|limit| limit as i64),
+                query.base.offset.map(|offset| offset as i64),
+            )?;
+        }
+
+        scanner.nprobs(query.nprobes);
+        scanner.use_index(query.use_index);
+        scanner.prefilter(query.base.prefilter);
+        match query.base.select {
+            Select::Columns(ref columns) => {
+                scanner.project(columns.as_slice())?;
+            }
+            Select::Dynamic(ref select_with_transform) => {
+                scanner.project_with_transform(select_with_transform.as_slice())?;
+            }
+            Select::All => {}
+        }
+
+        if query.base.with_row_id {
+            scanner.with_row_id();
+        }
+
+        scanner.batch_size(options.max_batch_length as usize);
+
+        if query.base.fast_search {
+            scanner.fast_search();
+        }
+
+        match &query.base.select {
+            Select::Columns(select) => {
+                scanner.project(select.as_slice())?;
+            }
+            Select::Dynamic(select_with_transform) => {
+                scanner.project_with_transform(select_with_transform.as_slice())?;
+            }
+            Select::All => { /* Do nothing */ }
+        }
+
+        if let Some(filter) = &query.base.filter {
+            scanner.filter(filter)?;
+        }
+
+        if let Some(fts) = &query.base.full_text_search {
+            scanner.full_text_search(fts.clone())?;
+        }
+
+        if let Some(refine_factor) = query.refine_factor {
+            scanner.refine(refine_factor);
+        }
+
+        if let Some(distance_type) = query.distance_type {
+            scanner.distance_metric(distance_type.into());
+        }
+
+        Ok(scanner.create_plan().await?)
     }
 
     async fn plain_query(
@@ -1425,14 +1899,6 @@ impl TableInternal for NativeTable {
     ) -> Result<DatasetRecordBatchStream> {
         self.generic_query(&query.clone().into_vector(), options)
             .await
-    }
-
-    async fn vector_query(
-        &self,
-        query: &VectorQuery,
-        options: QueryExecutionOptions,
-    ) -> Result<DatasetRecordBatchStream> {
-        self.generic_query(query, options).await
     }
 
     async fn merge_insert(
@@ -1466,7 +1932,7 @@ impl TableInternal for NativeTable {
             builder.when_not_matched_by_source(WhenNotMatchedBySource::Keep);
         }
         let job = builder.try_build()?;
-        let new_dataset = job.execute_reader(new_data).await?;
+        let (new_dataset, _stats) = job.execute_reader(new_data).await?;
         self.dataset.set_latest(new_dataset.as_ref().clone()).await;
         Ok(())
     }
@@ -1493,8 +1959,9 @@ impl TableInternal for NativeTable {
                     .compaction;
                 stats.prune = self
                     .optimize(OptimizeAction::Prune {
-                        older_than: Duration::try_days(7).unwrap(),
+                        older_than: None,
                         delete_unverified: None,
+                        error_if_tagged_old_versions: None,
                     })
                     .await?
                     .prune;
@@ -1510,10 +1977,15 @@ impl TableInternal for NativeTable {
             OptimizeAction::Prune {
                 older_than,
                 delete_unverified,
+                error_if_tagged_old_versions,
             } => {
                 stats.prune = Some(
-                    self.cleanup_old_versions(older_than, delete_unverified)
-                        .await?,
+                    self.cleanup_old_versions(
+                        older_than.unwrap_or(Duration::try_days(7).expect("valid delta")),
+                        delete_unverified,
+                        error_if_tagged_old_versions,
+                    )
+                    .await?,
                 );
             }
             OptimizeAction::Index(options) => {
@@ -1531,7 +2003,7 @@ impl TableInternal for NativeTable {
         self.dataset
             .get_mut()
             .await?
-            .add_columns(transforms, read_columns)
+            .add_columns(transforms, read_columns, None)
             .await?;
         Ok(())
     }
@@ -1553,24 +2025,75 @@ impl TableInternal for NativeTable {
     async fn list_indices(&self) -> Result<Vec<IndexConfig>> {
         let dataset = self.dataset.get().await?;
         let indices = dataset.load_indices().await?;
-        indices.iter().map(|idx| {
-            let mut is_vector = false;
+        futures::stream::iter(indices.as_slice()).then(|idx| async {
+            let stats = dataset.index_statistics(idx.name.as_str()).await?;
+            let stats: serde_json::Value = serde_json::from_str(&stats).map_err(|e| Error::Runtime {
+                message: format!("error deserializing index statistics: {}", e),
+            })?;
+            let index_type = stats.get("index_type").and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Runtime {
+                message: "index statistics was missing index type".to_string(),
+            })?;
+            let index_type: crate::index::IndexType = index_type.parse().map_err(|e| Error::Runtime {
+                message: format!("error parsing index type: {}", e),
+            })?;
+
             let mut columns = Vec::with_capacity(idx.fields.len());
             for field_id in &idx.fields {
                 let field = dataset.schema().field_by_id(*field_id).ok_or_else(|| Error::Runtime { message: format!("The index with name {} and uuid {} referenced a field with id {} which does not exist in the schema", idx.name, idx.uuid, field_id) })?;
-                if field.data_type().is_nested() {
-                    // Temporary hack to determine if an index is scalar or vector
-                    // Should be removed in https://github.com/lancedb/lance/issues/2039
-                    is_vector = true;
-                }
                 columns.push(field.name.clone());
             }
-            Ok(IndexConfig { index_type: if is_vector { crate::index::IndexType::IvfPq } else { crate::index::IndexType::BTree }, columns })
-        }).collect::<Result<Vec<_>>>()
+
+            let name = idx.name.clone();
+            Ok(IndexConfig { index_type, columns, name })
+        }).try_collect::<Vec<_>>().await
+    }
+
+    fn dataset_uri(&self) -> &str {
+        self.uri.as_str()
+    }
+
+    async fn index_stats(&self, index_name: &str) -> Result<Option<IndexStatistics>> {
+        let stats = match self
+            .dataset
+            .get()
+            .await?
+            .index_statistics(index_name.as_ref())
+            .await
+        {
+            Ok(stats) => stats,
+            Err(lance::error::Error::IndexNotFound { .. }) => return Ok(None),
+            Err(e) => return Err(Error::from(e)),
+        };
+
+        let mut stats: IndexStatisticsImpl =
+            serde_json::from_str(&stats).map_err(|e| Error::InvalidInput {
+                message: format!("error deserializing index statistics: {}", e),
+            })?;
+
+        let first_index = stats.indices.pop().ok_or_else(|| Error::InvalidInput {
+            message: "index statistics is empty".to_string(),
+        })?;
+        // Index type should be present at one of the levels.
+        let index_type =
+            stats
+                .index_type
+                .or(first_index.index_type)
+                .ok_or_else(|| Error::InvalidInput {
+                    message: "index statistics was missing index type".to_string(),
+                })?;
+        Ok(Some(IndexStatistics {
+            num_indexed_rows: stats.num_indexed_rows,
+            num_unindexed_rows: stats.num_unindexed_rows,
+            index_type,
+            distance_type: first_index.metric_type,
+            num_indices: stats.num_indices,
+        }))
     }
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::iter;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1578,6 +2101,7 @@ mod tests {
     use std::time::Duration;
 
     use arrow_array::{
+        builder::{ListBuilder, StringBuilder},
         Array, BooleanArray, Date32Array, FixedSizeListArray, Float32Array, Float64Array,
         Int32Array, Int64Array, LargeStringArray, RecordBatch, RecordBatchIterator,
         RecordBatchReader, StringArray, TimestampMillisecondArray, TimestampNanosecondArray,
@@ -1591,12 +2115,11 @@ mod tests {
     use rand::Rng;
     use tempfile::tempdir;
 
+    use super::*;
     use crate::connect;
     use crate::connection::ConnectBuilder;
     use crate::index::scalar::BTreeIndexBuilder;
     use crate::query::{ExecutableQuery, QueryBase};
-
-    use super::*;
 
     #[tokio::test]
     async fn test_open() {
@@ -2203,24 +2726,7 @@ mod tests {
 
         let table = conn.create_table("test", batches).execute().await.unwrap();
 
-        assert_eq!(
-            table
-                .as_native()
-                .unwrap()
-                .count_indexed_rows("my_index")
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            table
-                .as_native()
-                .unwrap()
-                .count_unindexed_rows("my_index")
-                .await
-                .unwrap(),
-            None
-        );
+        assert_eq!(table.index_stats("my_index").await.unwrap(), None);
 
         table
             .create_index(&["embeddings"], Index::Auto)
@@ -2237,25 +2743,141 @@ mod tests {
         assert_eq!(table.name(), "test");
 
         let indices = table.as_native().unwrap().load_indices().await.unwrap();
-        let index_uuid = &indices[0].index_uuid;
-        assert_eq!(
-            table
-                .as_native()
-                .unwrap()
-                .count_indexed_rows(index_uuid)
-                .await
-                .unwrap(),
-            Some(512)
+        let index_name = &indices[0].index_name;
+        let stats = table.index_stats(index_name).await.unwrap().unwrap();
+        assert_eq!(stats.num_indexed_rows, 512);
+        assert_eq!(stats.num_unindexed_rows, 0);
+        assert_eq!(stats.index_type, crate::index::IndexType::IvfPq);
+        assert_eq!(stats.distance_type, Some(crate::DistanceType::L2));
+    }
+
+    #[tokio::test]
+    async fn test_create_index_ivf_hnsw_sq() {
+        use arrow_array::RecordBatch;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use rand;
+        use std::iter::repeat_with;
+
+        use arrow_array::Float32Array;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+        let conn = connect(uri).execute().await.unwrap();
+
+        let dimension = 16;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "embeddings",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimension,
+            ),
+            false,
+        )]));
+
+        let mut rng = rand::thread_rng();
+        let float_arr = Float32Array::from(
+            repeat_with(|| rng.gen::<f32>())
+                .take(512 * dimension as usize)
+                .collect::<Vec<f32>>(),
         );
-        assert_eq!(
-            table
-                .as_native()
-                .unwrap()
-                .count_unindexed_rows(index_uuid)
-                .await
-                .unwrap(),
-            Some(0)
+
+        let vectors = Arc::new(create_fixed_size_list(float_arr, dimension).unwrap());
+        let batches = RecordBatchIterator::new(
+            vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()]
+                .into_iter()
+                .map(Ok),
+            schema,
         );
+
+        let table = conn.create_table("test", batches).execute().await.unwrap();
+
+        let stats = table.index_stats("my_index").await.unwrap();
+        assert!(stats.is_none());
+
+        let index = IvfHnswSqIndexBuilder::default();
+        table
+            .create_index(&["embeddings"], Index::IvfHnswSq(index))
+            .execute()
+            .await
+            .unwrap();
+
+        let index_configs = table.list_indices().await.unwrap();
+        assert_eq!(index_configs.len(), 1);
+        let index = index_configs.into_iter().next().unwrap();
+        assert_eq!(index.index_type, crate::index::IndexType::IvfHnswSq);
+        assert_eq!(index.columns, vec!["embeddings".to_string()]);
+        assert_eq!(table.count_rows(None).await.unwrap(), 512);
+        assert_eq!(table.name(), "test");
+
+        let indices = table.as_native().unwrap().load_indices().await.unwrap();
+        let index_name = &indices[0].index_name;
+        let stats = table.index_stats(index_name).await.unwrap().unwrap();
+        assert_eq!(stats.num_indexed_rows, 512);
+        assert_eq!(stats.num_unindexed_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_index_ivf_hnsw_pq() {
+        use arrow_array::RecordBatch;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use rand;
+        use std::iter::repeat_with;
+
+        use arrow_array::Float32Array;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+        let conn = connect(uri).execute().await.unwrap();
+
+        let dimension = 16;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "embeddings",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimension,
+            ),
+            false,
+        )]));
+
+        let mut rng = rand::thread_rng();
+        let float_arr = Float32Array::from(
+            repeat_with(|| rng.gen::<f32>())
+                .take(512 * dimension as usize)
+                .collect::<Vec<f32>>(),
+        );
+
+        let vectors = Arc::new(create_fixed_size_list(float_arr, dimension).unwrap());
+        let batches = RecordBatchIterator::new(
+            vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()]
+                .into_iter()
+                .map(Ok),
+            schema,
+        );
+
+        let table = conn.create_table("test", batches).execute().await.unwrap();
+        let stats = table.index_stats("my_index").await.unwrap();
+        assert!(stats.is_none());
+
+        let index = IvfHnswPqIndexBuilder::default();
+        table
+            .create_index(&["embeddings"], Index::IvfHnswPq(index))
+            .execute()
+            .await
+            .unwrap();
+
+        let index_configs = table.list_indices().await.unwrap();
+        assert_eq!(index_configs.len(), 1);
+        let index = index_configs.into_iter().next().unwrap();
+        assert_eq!(index.index_type, crate::index::IndexType::IvfHnswPq);
+        assert_eq!(index.columns, vec!["embeddings".to_string()]);
+        assert_eq!(table.count_rows(None).await.unwrap(), 512);
+        assert_eq!(table.name(), "test");
+
+        let indices: Vec<VectorIndex> = table.as_native().unwrap().load_indices().await.unwrap();
+        let index_name = &indices[0].index_name;
+        let stats = table.index_stats(index_name).await.unwrap().unwrap();
+        assert_eq!(stats.num_indexed_rows, 512);
+        assert_eq!(stats.num_unindexed_rows, 0);
     }
 
     fn create_fixed_size_list<T: Array>(values: T, list_size: i32) -> Result<FixedSizeListArray> {
@@ -2329,6 +2951,184 @@ mod tests {
         let index = index_configs.into_iter().next().unwrap();
         assert_eq!(index.index_type, crate::index::IndexType::BTree);
         assert_eq!(index.columns, vec!["i".to_string()]);
+
+        let indices = table.as_native().unwrap().load_indices().await.unwrap();
+        let index_name = &indices[0].index_name;
+        let stats = table.index_stats(index_name).await.unwrap().unwrap();
+        assert_eq!(stats.num_indexed_rows, 1);
+        assert_eq!(stats.num_unindexed_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_bitmap_index() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = ConnectBuilder::new(uri).execute().await.unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("category", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|i| format!("category_{}", i % 5)),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let table = conn
+            .create_table(
+                "test_bitmap",
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            )
+            .execute()
+            .await
+            .unwrap();
+
+        // Create bitmap index on the "category" column
+        table
+            .create_index(&["category"], Index::Bitmap(Default::default()))
+            .execute()
+            .await
+            .unwrap();
+
+        // Verify the index was created
+        let index_configs = table.list_indices().await.unwrap();
+        assert_eq!(index_configs.len(), 1);
+        let index = index_configs.into_iter().next().unwrap();
+        assert_eq!(index.index_type, crate::index::IndexType::Bitmap);
+        assert_eq!(index.columns, vec!["category".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_create_label_list_index() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = ConnectBuilder::new(uri).execute().await.unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "tags",
+                DataType::List(Field::new("item", DataType::Utf8, true).into()),
+                true,
+            ),
+        ]));
+
+        const TAGS: [&str; 3] = ["cat", "dog", "fish"];
+
+        let values_builder = StringBuilder::new();
+        let mut builder = ListBuilder::new(values_builder);
+        for i in 0..120 {
+            builder.values().append_value(TAGS[i % 3]);
+            if i % 3 == 0 {
+                builder.append(true)
+            }
+        }
+        let tags = Arc::new(builder.finish());
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..40)), tags],
+        )
+        .unwrap();
+
+        let table = conn
+            .create_table(
+                "test_bitmap",
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            )
+            .execute()
+            .await
+            .unwrap();
+
+        // Can not create btree or bitmap index on list column
+        assert!(table
+            .create_index(&["tags"], Index::BTree(Default::default()))
+            .execute()
+            .await
+            .is_err());
+        assert!(table
+            .create_index(&["tags"], Index::Bitmap(Default::default()))
+            .execute()
+            .await
+            .is_err());
+
+        // Create bitmap index on the "category" column
+        table
+            .create_index(&["tags"], Index::LabelList(Default::default()))
+            .execute()
+            .await
+            .unwrap();
+
+        // Verify the index was created
+        let index_configs = table.list_indices().await.unwrap();
+        assert_eq!(index_configs.len(), 1);
+        let index = index_configs.into_iter().next().unwrap();
+        assert_eq!(index.index_type, crate::index::IndexType::LabelList);
+        assert_eq!(index.columns, vec!["tags".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_create_inverted_index() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = ConnectBuilder::new(uri).execute().await.unwrap();
+        const WORDS: [&str; 3] = ["cat", "dog", "fish"];
+        let mut text_builder = StringBuilder::new();
+        let num_rows = 120;
+        for i in 0..num_rows {
+            text_builder.append_value(WORDS[i % 3]);
+        }
+        let text = Arc::new(text_builder.finish());
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
+                text,
+            ],
+        )
+        .unwrap();
+
+        let table = conn
+            .create_table(
+                "test_bitmap",
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            )
+            .execute()
+            .await
+            .unwrap();
+
+        table
+            .create_index(&["text"], Index::FTS(Default::default()))
+            .execute()
+            .await
+            .unwrap();
+        let index_configs = table.list_indices().await.unwrap();
+        assert_eq!(index_configs.len(), 1);
+        let index = index_configs.into_iter().next().unwrap();
+        assert_eq!(index.index_type, crate::index::IndexType::FTS);
+        assert_eq!(index.columns, vec!["text".to_string()]);
+        assert_eq!(index.name, "text_idx");
+
+        let stats = table.index_stats("text_idx").await.unwrap().unwrap();
+        assert_eq!(stats.num_indexed_rows, num_rows);
+        assert_eq!(stats.num_unindexed_rows, 0);
+        assert_eq!(stats.index_type, crate::index::IndexType::FTS);
+        assert_eq!(stats.distance_type, None);
     }
 
     #[tokio::test]

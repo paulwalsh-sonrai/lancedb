@@ -11,14 +11,16 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import inspect
+import asyncio
+from datetime import timedelta
 import logging
-import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 from urllib.parse import urlparse
+import warnings
 
-from cachetools import TTLCache
+from lancedb import connect_async
+from lancedb.remote import ClientConfig
 import pyarrow as pa
 from overrides import override
 
@@ -26,10 +28,8 @@ from ..common import DATA
 from ..db import DBConnection
 from ..embeddings import EmbeddingFunctionConfig
 from ..pydantic import LanceModel
-from ..table import Table, _sanitize_data
+from ..table import Table
 from ..util import validate_table_name
-from .arrow import to_ipc_binary
-from .client import ARROW_STREAM_CONTENT_TYPE, RestfulLanceDBClient
 
 
 class RemoteDBConnection(DBConnection):
@@ -42,25 +42,70 @@ class RemoteDBConnection(DBConnection):
         region: str,
         host_override: Optional[str] = None,
         request_thread_pool: Optional[ThreadPoolExecutor] = None,
-        connection_timeout: float = 120.0,
-        read_timeout: float = 300.0,
+        client_config: Union[ClientConfig, Dict[str, Any], None] = None,
+        connection_timeout: Optional[float] = None,
+        read_timeout: Optional[float] = None,
     ):
         """Connect to a remote LanceDB database."""
+
+        if isinstance(client_config, dict):
+            client_config = ClientConfig(**client_config)
+        elif client_config is None:
+            client_config = ClientConfig()
+
+        # These are legacy options from the old Python-based client. We keep them
+        # here for backwards compatibility, but will remove them in a future release.
+        if request_thread_pool is not None:
+            warnings.warn(
+                "request_thread_pool is no longer used and will be removed in "
+                "a future release.",
+                DeprecationWarning,
+            )
+
+        if connection_timeout is not None:
+            warnings.warn(
+                "connection_timeout is deprecated and will be removed in a future "
+                "release. Please use client_config.timeout_config.connect_timeout "
+                "instead.",
+                DeprecationWarning,
+            )
+            client_config.timeout_config.connect_timeout = timedelta(
+                seconds=connection_timeout
+            )
+
+        if read_timeout is not None:
+            warnings.warn(
+                "read_timeout is deprecated and will be removed in a future release. "
+                "Please use client_config.timeout_config.read_timeout instead.",
+                DeprecationWarning,
+            )
+            client_config.timeout_config.read_timeout = timedelta(seconds=read_timeout)
+
         parsed = urlparse(db_url)
         if parsed.scheme != "db":
             raise ValueError(f"Invalid scheme: {parsed.scheme}, only accepts db://")
         self.db_name = parsed.netloc
-        self.api_key = api_key
-        self._client = RestfulLanceDBClient(
-            self.db_name,
-            region,
-            api_key,
-            host_override,
-            connection_timeout=connection_timeout,
-            read_timeout=read_timeout,
+
+        import nest_asyncio
+
+        nest_asyncio.apply()
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+
+        self.client_config = client_config
+
+        self._conn = self._loop.run_until_complete(
+            connect_async(
+                db_url,
+                api_key=api_key,
+                region=region,
+                host_override=host_override,
+                client_config=client_config,
+            )
         )
-        self._request_thread_pool = request_thread_pool
-        self._table_cache = TTLCache(maxsize=10000, ttl=300)
 
     def __repr__(self) -> str:
         return f"RemoteConnect(name={self.db_name})"
@@ -82,16 +127,9 @@ class RemoteDBConnection(DBConnection):
         -------
         An iterator of table names.
         """
-        while True:
-            result = self._client.list_tables(limit, page_token)
-
-            if len(result) > 0:
-                page_token = result[len(result) - 1]
-            else:
-                break
-            for item in result:
-                self._table_cache[item] = True
-                yield item
+        return self._loop.run_until_complete(
+            self._conn.table_names(start_after=page_token, limit=limit)
+        )
 
     @override
     def open_table(self, name: str, *, index_cache_size: Optional[int] = None) -> Table:
@@ -108,20 +146,14 @@ class RemoteDBConnection(DBConnection):
         """
         from .table import RemoteTable
 
-        self._client.mount_retry_adapter_for_table(name)
-
         if index_cache_size is not None:
             logging.info(
                 "index_cache_size is ignored in LanceDb Cloud"
                 " (there is no local cache to configure)"
             )
 
-        # check if table exists
-        if self._table_cache.get(name) is None:
-            self._client.post(f"/v1/table/{name}/describe/")
-            self._table_cache[name] = True
-
-        return RemoteTable(self, name)
+        table = self._loop.run_until_complete(self._conn.open_table(name))
+        return RemoteTable(table, self.db_name, self._loop)
 
     @override
     def create_table(
@@ -227,50 +259,26 @@ class RemoteDBConnection(DBConnection):
 
         """
         validate_table_name(name)
-        if data is None and schema is None:
-            raise ValueError("Either data or schema must be provided.")
         if embedding_functions is not None:
             logging.warning(
                 "embedding_functions is not yet supported on LanceDB Cloud."
                 "Please vote https://github.com/lancedb/lancedb/issues/626 "
                 "for this feature."
             )
-        if mode is not None:
-            logging.warning("mode is not yet supported on LanceDB Cloud.")
-
-        if inspect.isclass(schema) and issubclass(schema, LanceModel):
-            # convert LanceModel to pyarrow schema
-            # note that it's possible this contains
-            # embedding function metadata already
-            schema = schema.to_arrow_schema()
-
-        if data is not None:
-            data = _sanitize_data(
-                data,
-                schema,
-                metadata=None,
-                on_bad_vectors=on_bad_vectors,
-                fill_value=fill_value,
-            )
-        else:
-            if schema is None:
-                raise ValueError("Either data or schema must be provided")
-            data = pa.Table.from_pylist([], schema=schema)
 
         from .table import RemoteTable
 
-        data = to_ipc_binary(data)
-        request_id = uuid.uuid4().hex
-
-        self._client.post(
-            f"/v1/table/{name}/create/",
-            data=data,
-            request_id=request_id,
-            content_type=ARROW_STREAM_CONTENT_TYPE,
+        table = self._loop.run_until_complete(
+            self._conn.create_table(
+                name,
+                data,
+                mode=mode,
+                schema=schema,
+                on_bad_vectors=on_bad_vectors,
+                fill_value=fill_value,
+            )
         )
-
-        self._table_cache[name] = True
-        return RemoteTable(self, name)
+        return RemoteTable(table, self.db_name, self._loop)
 
     @override
     def drop_table(self, name: str):
@@ -281,11 +289,7 @@ class RemoteDBConnection(DBConnection):
         name: str
             The name of the table.
         """
-
-        self._client.post(
-            f"/v1/table/{name}/drop/",
-        )
-        self._table_cache.pop(name)
+        self._loop.run_until_complete(self._conn.drop_table(name))
 
     @override
     def rename_table(self, cur_name: str, new_name: str):
@@ -298,12 +302,7 @@ class RemoteDBConnection(DBConnection):
         new_name: str
             The new name of the table.
         """
-        self._client.post(
-            f"/v1/table/{cur_name}/rename/",
-            json={"new_table_name": new_name},
-        )
-        self._table_cache.pop(cur_name)
-        self._table_cache[new_name] = True
+        self._loop.run_until_complete(self._conn.rename_table(cur_name, new_name))
 
     async def close(self):
         """Close the connection to the database."""

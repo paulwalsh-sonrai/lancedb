@@ -1,16 +1,7 @@
-#  Copyright 2023 LanceDB Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import binascii
 import functools
 import importlib
 import os
@@ -18,7 +9,7 @@ import pathlib
 import warnings
 from datetime import date, datetime
 from functools import singledispatch
-from typing import Tuple, Union
+from typing import Tuple, Union, Optional, Any
 from urllib.parse import urlparse
 
 import numpy as np
@@ -139,8 +130,11 @@ def join_uri(base: Union[str, pathlib.Path], *parts: str) -> str:
         # using pathlib for local paths make this windows compatible
         # `get_uri_scheme` returns `file` for windows drive names (e.g. `c:\path`)
         return str(pathlib.Path(base, *parts))
-    # for remote paths, just use os.path.join
-    return "/".join([p.rstrip("/") for p in [base, *parts]])
+    else:
+        # there might be query parameters in the base URI
+        url = urlparse(base)
+        new_path = "/".join([p.rstrip("/") for p in [url.path, *parts]])
+        return url._replace(path=new_path).geturl()
 
 
 def attempt_import_or_raise(module: str, mitigation=None):
@@ -218,6 +212,23 @@ def inf_vector_column_query(schema: pa.Schema) -> str:
     return vector_col_name
 
 
+def infer_vector_column_name(
+    schema: pa.Schema,
+    query_type: str,
+    query: Optional[Any],  # inferred later in query builder
+    vector_column_name: Optional[str],
+):
+    if (vector_column_name is None and query is not None and query_type != "fts") or (
+        vector_column_name is None and query_type == "hybrid"
+    ):
+        try:
+            vector_column_name = inf_vector_column_query(schema)
+        except Exception as e:
+            raise e
+
+    return vector_column_name
+
+
 @singledispatch
 def value_to_sql(value):
     raise NotImplementedError("SQL conversion is not implemented for this type")
@@ -225,7 +236,17 @@ def value_to_sql(value):
 
 @value_to_sql.register(str)
 def _(value: str):
+    value = value.replace("'", "''")
     return f"'{value}'"
+
+
+@value_to_sql.register(bytes)
+def _(value: bytes):
+    """Convert bytes to a hex string literal.
+
+    See https://datafusion.apache.org/user-guide/sql/data_types.html#binary-types
+    """
+    return f"X'{binascii.hexlify(value).decode()}'"
 
 
 @value_to_sql.register(int)

@@ -1,5 +1,17 @@
-from typing import List
+#  Copyright (c) 2023. LanceDB Developers
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
 
+from numpy import nan
 import pyarrow as pa
 
 from .base import Reranker
@@ -47,14 +59,42 @@ class LinearCombinationReranker(Reranker):
     def merge_results(
         self, vector_results: pa.Table, fts_results: pa.Table, fill: float
     ):
-        # If both are empty then just return an empty table
-        if len(vector_results) == 0 and len(fts_results) == 0:
-            return vector_results
-        # If one is empty then return the other
+        # If one is empty then return the other and add _relevance_score
+        # column equal the existing vector or fts score
         if len(vector_results) == 0:
-            return fts_results
+            results = fts_results.append_column(
+                "_relevance_score",
+                pa.array(fts_results["_score"], type=pa.float32()),
+            )
+            if self.score == "relevance":
+                results = self._keep_relevance_score(results)
+            elif self.score == "all":
+                results = results.append_column(
+                    "_distance",
+                    pa.array([nan] * len(fts_results), type=pa.float32()),
+                )
+            return results
+
         if len(fts_results) == 0:
-            return vector_results
+            # invert the distance to relevance score
+            results = vector_results.append_column(
+                "_relevance_score",
+                pa.array(
+                    [
+                        self._invert_score(distance)
+                        for distance in vector_results["_distance"].to_pylist()
+                    ],
+                    type=pa.float32(),
+                ),
+            )
+            if self.score == "relevance":
+                results = self._keep_relevance_score(results)
+            elif self.score == "all":
+                results = results.append_column(
+                    "_score",
+                    pa.array([nan] * len(vector_results), type=pa.float32()),
+                )
+            return results
 
         # sort both input tables on _rowid
         combined_list = []
@@ -71,12 +111,12 @@ class LinearCombinationReranker(Reranker):
             vi = vector_list[i]
             fj = fts_list[j]
             # invert the fts score from relevance to distance
-            inverted_fts_score = self._invert_score(fj["score"])
+            inverted_fts_score = self._invert_score(fj["_score"])
             if vi["_rowid"] == fj["_rowid"]:
                 vi["_relevance_score"] = self._combine_score(
                     vi["_distance"], inverted_fts_score
                 )
-                vi["score"] = fj["score"]  # keep the original score
+                vi["_score"] = fj["_score"]  # keep the original score
                 combined_list.append(vi)
                 i += 1
                 j += 1
@@ -105,13 +145,13 @@ class LinearCombinationReranker(Reranker):
             [("_relevance_score", "descending")]
         )
         if self.score == "relevance":
-            tbl = tbl.drop_columns(["score", "_distance"])
+            tbl = self._keep_relevance_score(tbl)
         return tbl
 
     def _combine_score(self, score1, score2):
         # these scores represent distance
         return 1 - (self.weight * score1 + (1 - self.weight) * score2)
 
-    def _invert_score(self, scores: List[float]):
-        # Invert the scores between relevance and distance
-        return 1 - scores
+    def _invert_score(self, score: float):
+        # Invert the score between relevance and distance
+        return 1 - score

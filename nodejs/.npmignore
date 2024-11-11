@@ -13,3 +13,12 @@ __test__
 renovate.json
 .idea
 src
+lancedb
+examples
+nodejs-artifacts
+Cargo.toml
+biome.json
+build.rs
+jest.config.js
+tsconfig.json
+typedoc.json

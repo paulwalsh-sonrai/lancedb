@@ -23,14 +23,15 @@ use super::TableInternal;
 /// A builder used to create and run a merge insert operation
 ///
 /// See [`super::Table::merge_insert`] for more context
+#[derive(Debug, Clone)]
 pub struct MergeInsertBuilder {
     table: Arc<dyn TableInternal>,
-    pub(super) on: Vec<String>,
-    pub(super) when_matched_update_all: bool,
-    pub(super) when_matched_update_all_filt: Option<String>,
-    pub(super) when_not_matched_insert_all: bool,
-    pub(super) when_not_matched_by_source_delete: bool,
-    pub(super) when_not_matched_by_source_delete_filt: Option<String>,
+    pub(crate) on: Vec<String>,
+    pub(crate) when_matched_update_all: bool,
+    pub(crate) when_matched_update_all_filt: Option<String>,
+    pub(crate) when_not_matched_insert_all: bool,
+    pub(crate) when_not_matched_by_source_delete: bool,
+    pub(crate) when_not_matched_by_source_delete_filt: Option<String>,
 }
 
 impl MergeInsertBuilder {

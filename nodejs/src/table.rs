@@ -15,21 +15,22 @@
 use arrow_ipc::writer::FileWriter;
 use lancedb::ipc::ipc_file_to_batches;
 use lancedb::table::{
-    AddDataMode, ColumnAlteration as LanceColumnAlteration, NewColumnTransform,
-    Table as LanceDbTable,
+    AddDataMode, ColumnAlteration as LanceColumnAlteration, Duration, NewColumnTransform,
+    OptimizeAction, OptimizeOptions, Table as LanceDbTable,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use crate::error::NapiErrorExt;
 use crate::index::Index;
+use crate::merge::NativeMergeInsertBuilder;
 use crate::query::{Query, VectorQuery};
 
 #[napi]
 pub struct Table {
     // We keep a duplicate of the table name so we can use it for error
     // messages even if the table has been closed
-    name: String,
+    pub name: String,
     pub(crate) inner: Option<LanceDbTable>,
 }
 
@@ -69,12 +70,9 @@ impl Table {
     }
 
     /// Return Schema as empty Arrow IPC file.
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn schema(&self) -> napi::Result<Buffer> {
-        let schema =
-            self.inner_ref()?.schema().await.map_err(|e| {
-                napi::Error::from_reason(format!("Failed to create IPC file: {}", e))
-            })?;
+        let schema = self.inner_ref()?.schema().await.default_error()?;
         let mut writer = FileWriter::try_new(vec![], &schema)
             .map_err(|e| napi::Error::from_reason(format!("Failed to create IPC file: {}", e)))?;
         writer
@@ -85,7 +83,7 @@ impl Table {
         })?))
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn add(&self, buf: Buffer, mode: String) -> napi::Result<()> {
         let batches = ipc_file_to_batches(buf.to_vec())
             .map_err(|e| napi::Error::from_reason(format!("Failed to read IPC file: {}", e)))?;
@@ -99,39 +97,24 @@ impl Table {
             return Err(napi::Error::from_reason(format!("Invalid mode: {}", mode)));
         };
 
-        op.execute().await.map_err(|e| {
-            napi::Error::from_reason(format!(
-                "Failed to add batches to table {}: {}",
-                self.name, e
-            ))
-        })
+        op.execute().await.default_error()
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn count_rows(&self, filter: Option<String>) -> napi::Result<i64> {
         self.inner_ref()?
             .count_rows(filter)
             .await
             .map(|val| val as i64)
-            .map_err(|e| {
-                napi::Error::from_reason(format!(
-                    "Failed to count rows in table {}: {}",
-                    self.name, e
-                ))
-            })
+            .default_error()
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn delete(&self, predicate: String) -> napi::Result<()> {
-        self.inner_ref()?.delete(&predicate).await.map_err(|e| {
-            napi::Error::from_reason(format!(
-                "Failed to delete rows in table {}: predicate={}",
-                self.name, e
-            ))
-        })
+        self.inner_ref()?.delete(&predicate).await.default_error()
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn create_index(
         &self,
         index: Option<&Index>,
@@ -150,12 +133,12 @@ impl Table {
         builder.execute().await.default_error()
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn update(
         &self,
         only_if: Option<String>,
         columns: Vec<(String, String)>,
-    ) -> napi::Result<()> {
+    ) -> napi::Result<u64> {
         let mut op = self.inner_ref()?.update();
         if let Some(only_if) = only_if {
             op = op.only_if(only_if);
@@ -166,17 +149,17 @@ impl Table {
         op.execute().await.default_error()
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn query(&self) -> napi::Result<Query> {
         Ok(Query::new(self.inner_ref()?.query()))
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn vector_search(&self, vector: Float32Array) -> napi::Result<VectorQuery> {
         self.query()?.nearest_to(vector)
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn add_columns(&self, transforms: Vec<AddColumnsSql>) -> napi::Result<()> {
         let transforms = transforms
             .into_iter()
@@ -186,16 +169,11 @@ impl Table {
         self.inner_ref()?
             .add_columns(transforms, None)
             .await
-            .map_err(|err| {
-                napi::Error::from_reason(format!(
-                    "Failed to add columns to table {}: {}",
-                    self.name, err
-                ))
-            })?;
+            .default_error()?;
         Ok(())
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn alter_columns(&self, alterations: Vec<ColumnAlteration>) -> napi::Result<()> {
         for alteration in &alterations {
             if alteration.rename.is_none() && alteration.nullable.is_none() {
@@ -212,31 +190,21 @@ impl Table {
         self.inner_ref()?
             .alter_columns(&alterations)
             .await
-            .map_err(|err| {
-                napi::Error::from_reason(format!(
-                    "Failed to alter columns in table {}: {}",
-                    self.name, err
-                ))
-            })?;
+            .default_error()?;
         Ok(())
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn drop_columns(&self, columns: Vec<String>) -> napi::Result<()> {
         let col_refs = columns.iter().map(String::as_str).collect::<Vec<_>>();
         self.inner_ref()?
             .drop_columns(&col_refs)
             .await
-            .map_err(|err| {
-                napi::Error::from_reason(format!(
-                    "Failed to drop columns from table {}: {}",
-                    self.name, err
-                ))
-            })?;
+            .default_error()?;
         Ok(())
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn version(&self) -> napi::Result<i64> {
         self.inner_ref()?
             .version()
@@ -245,7 +213,7 @@ impl Table {
             .default_error()
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn checkout(&self, version: i64) -> napi::Result<()> {
         self.inner_ref()?
             .checkout(version as u64)
@@ -253,17 +221,76 @@ impl Table {
             .default_error()
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn checkout_latest(&self) -> napi::Result<()> {
         self.inner_ref()?.checkout_latest().await.default_error()
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub async fn restore(&self) -> napi::Result<()> {
         self.inner_ref()?.restore().await.default_error()
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
+    pub async fn optimize(
+        &self,
+        older_than_ms: Option<i64>,
+        delete_unverified: Option<bool>,
+    ) -> napi::Result<OptimizeStats> {
+        let inner = self.inner_ref()?;
+
+        let older_than = if let Some(ms) = older_than_ms {
+            if ms == i64::MIN {
+                return Err(napi::Error::from_reason(format!(
+                    "older_than_ms can not be {}",
+                    i32::MIN,
+                )));
+            }
+            Duration::try_milliseconds(ms)
+        } else {
+            None
+        };
+
+        let compaction_stats = inner
+            .optimize(OptimizeAction::Compact {
+                options: lancedb::table::CompactionOptions::default(),
+                remap_options: None,
+            })
+            .await
+            .default_error()?
+            .compaction
+            .unwrap();
+        let prune_stats = inner
+            .optimize(OptimizeAction::Prune {
+                older_than,
+                delete_unverified,
+                error_if_tagged_old_versions: None,
+            })
+            .await
+            .default_error()?
+            .prune
+            .unwrap();
+        inner
+            .optimize(lancedb::table::OptimizeAction::Index(
+                OptimizeOptions::default(),
+            ))
+            .await
+            .default_error()?;
+        Ok(OptimizeStats {
+            compaction: CompactionStats {
+                files_added: compaction_stats.files_added as i64,
+                files_removed: compaction_stats.files_removed as i64,
+                fragments_added: compaction_stats.fragments_added as i64,
+                fragments_removed: compaction_stats.fragments_removed as i64,
+            },
+            prune: RemovalStats {
+                bytes_removed: prune_stats.bytes_removed as i64,
+                old_versions_removed: prune_stats.old_versions as i64,
+            },
+        })
+    }
+
+    #[napi(catch_unwind)]
     pub async fn list_indices(&self) -> napi::Result<Vec<IndexConfig>> {
         Ok(self
             .inner_ref()?
@@ -274,16 +301,51 @@ impl Table {
             .map(IndexConfig::from)
             .collect::<Vec<_>>())
     }
+
+    #[napi(catch_unwind)]
+    pub async fn index_stats(&self, index_name: String) -> napi::Result<Option<IndexStatistics>> {
+        let tbl = self.inner_ref()?;
+        let stats = tbl.index_stats(&index_name).await.default_error()?;
+        Ok(stats.map(IndexStatistics::from))
+    }
+
+    #[napi(catch_unwind)]
+    pub fn merge_insert(&self, on: Vec<String>) -> napi::Result<NativeMergeInsertBuilder> {
+        let on: Vec<_> = on.iter().map(String::as_str).collect();
+        Ok(self.inner_ref()?.merge_insert(on.as_slice()).into())
+    }
+
+    #[napi(catch_unwind)]
+    pub async fn uses_v2_manifest_paths(&self) -> napi::Result<bool> {
+        self.inner_ref()?
+            .as_native()
+            .ok_or_else(|| napi::Error::from_reason("This cannot be run on a remote table"))?
+            .uses_v2_manifest_paths()
+            .await
+            .default_error()
+    }
+
+    #[napi(catch_unwind)]
+    pub async fn migrate_manifest_paths_v2(&self) -> napi::Result<()> {
+        self.inner_ref()?
+            .as_native()
+            .ok_or_else(|| napi::Error::from_reason("This cannot be run on a remote table"))?
+            .migrate_manifest_paths_v2()
+            .await
+            .default_error()
+    }
 }
 
 #[napi(object)]
 /// A description of an index currently configured on a column
 pub struct IndexConfig {
+    /// The name of the index
+    pub name: String,
     /// The type of the index
     pub index_type: String,
     /// The columns in the index
     ///
-    /// Currently this is always an array of size 1.  In the future there may
+    /// Currently this is always an array of size 1. In the future there may
     /// be more columns to represent composite indices.
     pub columns: Vec<String>,
 }
@@ -294,8 +356,43 @@ impl From<lancedb::index::IndexConfig> for IndexConfig {
         Self {
             index_type,
             columns: value.columns,
+            name: value.name,
         }
     }
+}
+
+/// Statistics about a compaction operation.
+#[napi(object)]
+#[derive(Clone, Debug)]
+pub struct CompactionStats {
+    /// The number of fragments removed
+    pub fragments_removed: i64,
+    /// The number of new, compacted fragments added
+    pub fragments_added: i64,
+    /// The number of data files removed
+    pub files_removed: i64,
+    /// The number of new, compacted data files added
+    pub files_added: i64,
+}
+
+/// Statistics about a cleanup operation
+#[napi(object)]
+#[derive(Clone, Debug)]
+pub struct RemovalStats {
+    /// The number of bytes removed
+    pub bytes_removed: i64,
+    /// The number of old versions removed
+    pub old_versions_removed: i64,
+}
+
+/// Statistics about an optimize operation
+#[napi(object)]
+#[derive(Clone, Debug)]
+pub struct OptimizeStats {
+    /// Statistics about the compaction operation
+    pub compaction: CompactionStats,
+    /// Statistics about the removal operation
+    pub prune: RemovalStats,
 }
 
 ///  A definition of a column alteration. The alteration changes the column at
@@ -341,4 +438,31 @@ pub struct AddColumnsSql {
     /// The values to populate the new column with, as a SQL expression.
     /// The expression can reference other columns in the table.
     pub value_sql: String,
+}
+
+#[napi(object)]
+pub struct IndexStatistics {
+    /// The number of rows indexed by the index
+    pub num_indexed_rows: f64,
+    /// The number of rows not indexed
+    pub num_unindexed_rows: f64,
+    /// The type of the index
+    pub index_type: String,
+    /// The type of the distance function used by the index. This is only
+    /// present for vector indices. Scalar and full text search indices do
+    /// not have a distance function.
+    pub distance_type: Option<String>,
+    /// The number of parts this index is split into.
+    pub num_indices: Option<u32>,
+}
+impl From<lancedb::index::IndexStatistics> for IndexStatistics {
+    fn from(value: lancedb::index::IndexStatistics) -> Self {
+        Self {
+            num_indexed_rows: value.num_indexed_rows as f64,
+            num_unindexed_rows: value.num_unindexed_rows as f64,
+            index_type: value.index_type.to_string(),
+            distance_type: value.distance_type.map(|d| d.to_string()),
+            num_indices: value.num_indices,
+        }
+    }
 }

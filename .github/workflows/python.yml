@@ -33,11 +33,11 @@ jobs:
           python-version: "3.11"
       - name: Install ruff
         run: |
-          pip install ruff==0.2.2
+          pip install ruff==0.5.4
       - name: Format check
         run: ruff format --check .
       - name: Lint
-        run: ruff .
+        run: ruff check .
   doctest:
     name: "Doctest"
     timeout-minutes: 30
@@ -65,7 +65,7 @@ jobs:
           workspaces: python
       - name: Install
         run: |
-          pip install -e .[tests,dev,embeddings]
+          pip install --extra-index-url https://pypi.fury.io/lancedb/ -e .[tests,dev,embeddings]
           pip install tantivy
           pip install mlx
       - name: Doctest
@@ -75,7 +75,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       matrix:
-        python-minor-version: ["8", "11"]
+        python-minor-version: ["9", "11"]
     runs-on: "ubuntu-22.04"
     defaults:
       run:
@@ -189,7 +189,7 @@ jobs:
       - name: Install lancedb
         run: |
           pip install "pydantic<2"
-          pip install -e .[tests]
+          pip install --extra-index-url https://pypi.fury.io/lancedb/ -e .[tests]
           pip install tantivy
       - name: Run tests
         run: pytest -m "not slow and not s3_test" -x -v --durations=30 python/tests

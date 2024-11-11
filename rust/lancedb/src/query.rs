@@ -17,7 +17,11 @@ use std::sync::Arc;
 
 use arrow_array::{make_array, Array, Float16Array, Float32Array, Float64Array};
 use arrow_schema::DataType;
+use datafusion_physical_plan::ExecutionPlan;
 use half::f16;
+use lance::dataset::scanner::DatasetRecordBatchStream;
+use lance_datafusion::exec::execute_plan;
+use lance_index::scalar::FullTextSearchQuery;
 
 use crate::arrow::SendableRecordBatchStream;
 use crate::error::{Error, Result};
@@ -334,6 +338,12 @@ pub trait QueryBase {
     /// it will default to 10.
     fn limit(self, limit: usize) -> Self;
 
+    /// Set the offset of the query.
+
+    /// By default, it fetches starting with the first row.
+    /// This method can be used to skip the first `offset` rows.
+    fn offset(self, offset: usize) -> Self;
+
     /// Only return rows which match the filter.
     ///
     /// The filter should be supplied as an SQL query string.  For example:
@@ -347,6 +357,17 @@ pub trait QueryBase {
     /// Filtering performance can often be improved by creating a scalar index
     /// on the filter column(s).
     fn only_if(self, filter: impl AsRef<str>) -> Self;
+
+    /// Perform a full text search on the table.
+    ///
+    /// The results will be returned in order of BM25 scores.
+    ///
+    /// This method is only valid on tables that have a full text search index.
+    ///
+    /// ```ignore
+    /// query.full_text_search(FullTextSearchQuery::new("hello world"))
+    /// ```
+    fn full_text_search(self, query: FullTextSearchQuery) -> Self;
 
     /// Return only the specified columns.
     ///
@@ -371,6 +392,39 @@ pub trait QueryBase {
     /// Columns will always be returned in the order given, even if that order is different than
     /// the order used when adding the data.
     fn select(self, selection: Select) -> Self;
+
+    /// Only execute the query over indexed data.
+    ///
+    /// This allows weak-consistent fast path for queries that only need to access the indexed data.
+    ///
+    /// Users can use [`crate::Table::optimize`] to merge new data into the index, and make the
+    /// new data available for fast search.
+    ///
+    /// By default, it is false.
+    fn fast_search(self) -> Self;
+
+    /// If this is called then filtering will happen after the vector search instead of
+    /// before.
+    ///
+    /// By default filtering will be performed before the vector search.  This is how
+    /// filtering is typically understood to work.  This prefilter step does add some
+    /// additional latency.  Creating a scalar index on the filter column(s) can
+    /// often improve this latency.  However, sometimes a filter is too complex or scalar
+    /// indices cannot be applied to the column.  In these cases postfiltering can be
+    /// used instead of prefiltering to improve latency.
+    ///
+    /// Post filtering applies the filter to the results of the vector search.  This means
+    /// we only run the filter on a much smaller set of data.  However, it can cause the
+    /// query to return fewer than `limit` results (or even no results) if none of the nearest
+    /// results match the filter.
+    ///
+    /// Post filtering happens during the "refine stage" (described in more detail in
+    /// [`Self::refine_factor`]).  This means that setting a higher refine factor can often
+    /// help restore some of the results lost by post filtering.
+    fn postfilter(self) -> Self;
+
+    /// Return the `_rowid` meta column from the Table.
+    fn with_row_id(self) -> Self;
 }
 
 pub trait HasQuery {
@@ -383,13 +437,38 @@ impl<T: HasQuery> QueryBase for T {
         self
     }
 
+    fn offset(mut self, offset: usize) -> Self {
+        self.mut_query().offset = Some(offset);
+        self
+    }
+
     fn only_if(mut self, filter: impl AsRef<str>) -> Self {
         self.mut_query().filter = Some(filter.as_ref().to_string());
         self
     }
 
+    fn full_text_search(mut self, query: FullTextSearchQuery) -> Self {
+        self.mut_query().full_text_search = Some(query);
+        self
+    }
+
     fn select(mut self, select: Select) -> Self {
         self.mut_query().select = select;
+        self
+    }
+
+    fn fast_search(mut self) -> Self {
+        self.mut_query().fast_search = true;
+        self
+    }
+
+    fn postfilter(mut self) -> Self {
+        self.mut_query().prefilter = false;
+        self
+    }
+
+    fn with_row_id(mut self) -> Self {
+        self.mut_query().with_row_id = true;
         self
     }
 }
@@ -425,6 +504,15 @@ impl Default for QueryExecutionOptions {
 /// There are various kinds of queries but they all return results
 /// in the same way.
 pub trait ExecutableQuery {
+    /// Return the Datafusion [ExecutionPlan].
+    ///
+    /// The caller can further optimize the plan or execute it.
+    ///
+    fn create_plan(
+        &self,
+        options: QueryExecutionOptions,
+    ) -> impl Future<Output = Result<Arc<dyn ExecutionPlan>>> + Send;
+
     /// Execute the query with default options and return results
     ///
     /// See [`ExecutableQuery::execute_with_options`] for more details.
@@ -453,6 +541,8 @@ pub trait ExecutableQuery {
         &self,
         options: QueryExecutionOptions,
     ) -> impl Future<Output = Result<SendableRecordBatchStream>> + Send;
+
+    fn explain_plan(&self, verbose: bool) -> impl Future<Output = Result<String>> + Send;
 }
 
 /// A builder for LanceDB queries.
@@ -473,10 +563,32 @@ pub struct Query {
 
     /// limit the number of rows to return.
     pub(crate) limit: Option<usize>,
+
+    /// Offset of the query.
+    pub(crate) offset: Option<usize>,
+
     /// Apply filter to the returned rows.
     pub(crate) filter: Option<String>,
+
+    /// Perform a full text search on the table.
+    pub(crate) full_text_search: Option<FullTextSearchQuery>,
+
     /// Select column projection.
     pub(crate) select: Select,
+
+    /// If set to true, the query is executed only on the indexed data,
+    /// and yields faster results.
+    ///
+    /// By default, this is false.
+    pub(crate) fast_search: bool,
+
+    /// If set to true, the query will return the `_rowid` meta column.
+    ///
+    /// By default, this is false.
+    pub(crate) with_row_id: bool,
+
+    /// If set to false, the filter will be applied after the vector search.
+    pub(crate) prefilter: bool,
 }
 
 impl Query {
@@ -484,8 +596,13 @@ impl Query {
         Self {
             parent,
             limit: None,
+            offset: None,
             filter: None,
+            full_text_search: None,
             select: Select::All,
+            fast_search: false,
+            with_row_id: false,
+            prefilter: true,
         }
     }
 
@@ -545,6 +662,13 @@ impl HasQuery for Query {
 }
 
 impl ExecutableQuery for Query {
+    async fn create_plan(&self, options: QueryExecutionOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        self.parent
+            .clone()
+            .create_plan(&self.clone().into_vector(), options)
+            .await
+    }
+
     async fn execute_with_options(
         &self,
         options: QueryExecutionOptions,
@@ -552,6 +676,12 @@ impl ExecutableQuery for Query {
         Ok(SendableRecordBatchStream::from(
             self.parent.clone().plain_query(self, options).await?,
         ))
+    }
+
+    async fn explain_plan(&self, verbose: bool) -> Result<String> {
+        self.parent
+            .explain_plan(&self.clone().into_vector(), verbose)
+            .await
     }
 }
 
@@ -577,8 +707,6 @@ pub struct VectorQuery {
     pub(crate) distance_type: Option<DistanceType>,
     /// Default is true. Set to false to enforce a brute force search.
     pub(crate) use_index: bool,
-    /// Apply filter before ANN search/
-    pub(crate) prefilter: bool,
 }
 
 impl VectorQuery {
@@ -591,7 +719,6 @@ impl VectorQuery {
             refine_factor: None,
             distance_type: None,
             use_index: true,
-            prefilter: true,
         }
     }
 
@@ -681,29 +808,6 @@ impl VectorQuery {
         self
     }
 
-    /// If this is called then filtering will happen after the vector search instead of
-    /// before.
-    ///
-    /// By default filtering will be performed before the vector search.  This is how
-    /// filtering is typically understood to work.  This prefilter step does add some
-    /// additional latency.  Creating a scalar index on the filter column(s) can
-    /// often improve this latency.  However, sometimes a filter is too complex or scalar
-    /// indices cannot be applied to the column.  In these cases postfiltering can be
-    /// used instead of prefiltering to improve latency.
-    ///
-    /// Post filtering applies the filter to the results of the vector search.  This means
-    /// we only run the filter on a much smaller set of data.  However, it can cause the
-    /// query to return fewer than `limit` results (or even no results) if none of the nearest
-    /// results match the filter.
-    ///
-    /// Post filtering happens during the "refine stage" (described in more detail in
-    /// [`Self::refine_factor`]).  This means that setting a higher refine factor can often
-    /// help restore some of the results lost by post filtering.
-    pub fn postfilter(mut self) -> Self {
-        self.prefilter = false;
-        self
-    }
-
     /// If this is called then any vector index is skipped
     ///
     /// An exhaustive (flat) search will be performed.  The query vector will
@@ -718,13 +822,24 @@ impl VectorQuery {
 }
 
 impl ExecutableQuery for VectorQuery {
+    async fn create_plan(&self, options: QueryExecutionOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        self.base.parent.clone().create_plan(self, options).await
+    }
+
     async fn execute_with_options(
         &self,
         options: QueryExecutionOptions,
     ) -> Result<SendableRecordBatchStream> {
         Ok(SendableRecordBatchStream::from(
-            self.base.parent.clone().vector_query(self, options).await?,
+            DatasetRecordBatchStream::new(execute_plan(
+                self.create_plan(options).await?,
+                Default::default(),
+            )?),
         ))
+    }
+
+    async fn explain_plan(&self, verbose: bool) -> Result<String> {
+        self.base.parent.explain_plan(self, verbose).await
     }
 }
 
@@ -775,6 +890,7 @@ mod tests {
         let query = table
             .query()
             .limit(100)
+            .offset(1)
             .nearest_to(&[9.8, 8.7])
             .unwrap()
             .nprobes(1000)
@@ -787,6 +903,7 @@ mod tests {
             new_vector
         );
         assert_eq!(query.base.limit.unwrap(), 100);
+        assert_eq!(query.base.offset.unwrap(), 1);
         assert_eq!(query.nprobes, 1000);
         assert!(query.use_index);
         assert_eq!(query.distance_type, Some(DistanceType::Cosine));
@@ -833,9 +950,25 @@ mod tests {
         let result = query.execute().await;
         let mut stream = result.expect("should have result");
         // should only have one batch
+
         while let Some(batch) = stream.next().await {
             // pre filter should return 10 rows
             assert!(batch.expect("should be Ok").num_rows() == 10);
+        }
+
+        let query = table
+            .query()
+            .limit(10)
+            .offset(1)
+            .only_if(String::from("id % 2 == 0"))
+            .nearest_to(&[0.1; 4])
+            .unwrap();
+        let result = query.execute().await;
+        let mut stream = result.expect("should have result");
+        // should only have one batch
+        while let Some(batch) = stream.next().await {
+            // pre filter should return 10 rows
+            assert!(batch.expect("should be Ok").num_rows() == 9);
         }
     }
 
@@ -963,6 +1096,7 @@ mod tests {
             .query()
             .execute_with_options(QueryExecutionOptions {
                 max_batch_length: 10,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -970,6 +1104,30 @@ mod tests {
         while let Some(batch) = results.next().await {
             assert!(batch.unwrap().num_rows() <= 10);
         }
+    }
+
+    fn assert_plan_exists(plan: &Arc<dyn ExecutionPlan>, name: &str) -> bool {
+        if plan.name() == name {
+            return true;
+        }
+        plan.children()
+            .iter()
+            .any(|child| assert_plan_exists(child, name))
+    }
+
+    #[tokio::test]
+    async fn test_create_execute_plan() {
+        let tmp_dir = tempdir().unwrap();
+        let table = make_test_table(&tmp_dir).await;
+        let plan = table
+            .query()
+            .nearest_to(vec![0.1, 0.2, 0.3, 0.4])
+            .unwrap()
+            .create_plan(QueryExecutionOptions::default())
+            .await
+            .unwrap();
+        assert_plan_exists(&plan, "KNNFlatSearch");
+        assert_plan_exists(&plan, "ProjectionExec");
     }
 
     #[tokio::test]
@@ -989,5 +1147,54 @@ mod tests {
         let first_batch = results.next().await.unwrap().unwrap();
         assert_eq!(first_batch.num_rows(), 1);
         assert!(results.next().await.is_none());
+
+        // query with wrong vector dimension
+        let error_result = table
+            .vector_search(&[1.0, 2.0, 3.0])
+            .unwrap()
+            .limit(1)
+            .execute()
+            .await;
+        assert!(error_result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("No vector column found to match with the query vector dimension: 3"));
+    }
+
+    #[tokio::test]
+    async fn test_fast_search_plan() {
+        let tmp_dir = tempdir().unwrap();
+        let table = make_test_table(&tmp_dir).await;
+        let plan = table
+            .query()
+            .select(Select::columns(&["_distance"]))
+            .nearest_to(vec![0.1, 0.2, 0.3, 0.4])
+            .unwrap()
+            .fast_search()
+            .explain_plan(true)
+            .await
+            .unwrap();
+        assert!(!plan.contains("Take"));
+    }
+
+    #[tokio::test]
+    async fn test_with_row_id() {
+        let tmp_dir = tempdir().unwrap();
+        let table = make_test_table(&tmp_dir).await;
+        let results = table
+            .vector_search(&[0.1, 0.2, 0.3, 0.4])
+            .unwrap()
+            .with_row_id()
+            .limit(10)
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        for batch in results {
+            assert!(batch.column_by_name("_rowid").is_some());
+        }
     }
 }
